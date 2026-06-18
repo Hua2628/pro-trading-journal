@@ -184,16 +184,16 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
             if isinstance(d.columns, pd.MultiIndex): 
                 d.columns = d.columns.get_level_values(0)
         
-        df = df.reset_index().rename(columns={
-            'Date': 'time', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
-        })
-        # 🔥 修復雲端 yfinance 產生重複日期的 Bug (導致標記漂移的元凶)
-        df['time'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
-        df = df.drop_duplicates(subset=['time'], keep='last')
+        df = df.reset_index()
+        # 👇 避免雲端 yfinance 欄位名稱變異，強制抓第0欄
+        df.rename(columns={df.columns[0]: 'time', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
         
-        spx_df = spx_df.reset_index().rename(columns={'Date': 'time', 'Close': 'SPX'}) 
-        spx_df['time'] = pd.to_datetime(spx_df['time']).dt.strftime('%Y-%m-%d')
-        spx_df = spx_df.drop_duplicates(subset=['time'], keep='last')
+        # 🚀 解決標記漂移的關鍵：加上 utc=True 與 tz_localize(None) 強制清除雲端時區，確保 x 軸是純日期
+        df['time'] = pd.to_datetime(df['time'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+        
+        spx_df = spx_df.reset_index()
+        spx_df.rename(columns={spx_df.columns[0]: 'time', 'Close': 'SPX'}, inplace=True) 
+        spx_df['time'] = pd.to_datetime(spx_df['time'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
         
         df = pd.merge(df, spx_df[['time', 'SPX']], on='time', how='left').ffill()
         
@@ -317,7 +317,6 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
     except Exception as e:
         import traceback
         return f"圖表發生錯誤: {str(e)}"
-
 # ==========================================
 # 👉 100% 原始績效計算邏輯
 # ==========================================
