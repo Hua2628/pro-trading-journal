@@ -15,7 +15,7 @@ import io
 from sqlalchemy import text
 from supabase import create_client, Client
 
-# 👉 [UI優化] 1. 全域環境設定與自訂 CSS 注入
+# 👉 [UI優化] 1. 全域環境設定與自訂 CSS 注入 (提升卡片與按鈕質感)
 st.set_page_config(page_title="Pro Trading Journal", layout="wide", page_icon="📈")
 st.markdown("""
 <style>
@@ -54,11 +54,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 雲端連線設定 ---
+# --- 1. 環境設定與雲端資料庫初始化 ---
 conn = st.connection("postgresql", type="sql", ttl=0)
-url_supa: str = st.secrets["SUPABASE_URL"]
-key_supa: str = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(url_supa, key_supa)
+url: str = st.secrets["SUPABASE_URL"]
+key: str = st.secrets["SUPABASE_KEY"]  # 請確保此處在 Secrets 填入的是 service_role key
+supabase: Client = create_client(url, key)
 STORAGE_BUCKET = "trade_images"
 
 def init_db():
@@ -71,7 +71,11 @@ def init_db():
             )
         """))
         s.execute(text("CREATE TABLE IF NOT EXISTS market_notes (date TEXT PRIMARY KEY, note TEXT)"))
-        s.execute(text("CREATE TABLE IF NOT EXISTS cash_flows (flow_id TEXT PRIMARY KEY, date TEXT, amount REAL, note TEXT)"))
+        s.execute(text("""
+        CREATE TABLE IF NOT EXISTS cash_flows (
+            flow_id TEXT PRIMARY KEY, date TEXT, amount REAL, note TEXT
+        )
+        """))
         s.execute(text("CREATE TABLE IF NOT EXISTS trade_images (trade_id TEXT, image_path TEXT, category TEXT DEFAULT 'general')"))
         s.execute(text("CREATE TABLE IF NOT EXISTS monthly_reviews (month_id TEXT PRIMARY KEY, note TEXT)"))
         s.execute(text("CREATE TABLE IF NOT EXISTS strategy_tags (name TEXT PRIMARY KEY)"))
@@ -81,12 +85,12 @@ def init_db():
         cursor = s.execute(text("SELECT COUNT(*) FROM strategy_tags"))
         if cursor.fetchone()[0] == 0:
             for strat in ["EP", "突破", "M.E.T.A", "情緒性交易"]:
-                s.execute(text("INSERT INTO strategy_tags (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": strat})
+                s.execute(text("INSERT INTO strategy_tags (name) VALUES (:n) ON CONFLICT DO NOTHING"), {"n": strat})
         else:
              s.execute(text("INSERT INTO strategy_tags (name) VALUES ('情緒性交易') ON CONFLICT DO NOTHING"))
         s.commit()
 
-# --- 極速快取函數 ---
+# --- 極速快取設計：大幅降低重複讀取時間 ---
 @st.cache_data(ttl="1d") 
 def get_stock_data(symbol):
     return yf.download(symbol, period="5y", interval='1d', progress=False)
@@ -95,7 +99,7 @@ def get_stock_data(symbol):
 def get_spx_data():
     return yf.download('^GSPC', period="5y", interval='1d', progress=False)
 
-# 👇 解決慢到爆的救星：獨立快取即時報價 (5分鐘更新一次)
+# 👇 解決慢到爆的救星：獨立快取即時報價 (5分鐘更新一次，終結卡頓)
 @st.cache_data(ttl="5m")
 def get_latest_price(symbol):
     try:
@@ -105,15 +109,16 @@ def get_latest_price(symbol):
         return 0
 
 @st.cache_data(ttl="1h")
-def fetch_github_csv(pat, url_csv):
+def fetch_github_csv(pat, fetch_url):
     headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3.raw"}
     try:
-        res = requests.get(url_csv, headers=headers, timeout=10)
-        if res.status_code == 200: return res.text
+        res = requests.get(fetch_url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            return res.text
         return None
     except: return None
 
-# --- 雲端自動存檔函數 ---
+# --- 雲端資料庫存檔邏輯 ---
 def auto_save_risk_params():
     if 'current_trade' in st.session_state:
         tid = st.session_state.current_trade['trade_id']
@@ -122,10 +127,8 @@ def auto_save_risk_params():
         risk_val = st.session_state.get(f"risk_{tid}", 1.0)
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result:
-                s.execute(text("UPDATE notes SET initial_sl=:sl, trailing_sl=:trail, max_risk_pct=:risk WHERE trade_id=:tid"), {"sl": sl_val, "trail": trail_val, "risk": risk_val, "tid": tid})
-            else:
-                s.execute(text("INSERT INTO notes (trade_id, initial_sl, trailing_sl, max_risk_pct) VALUES (:tid, :sl, :trail, :risk)"), {"tid": tid, "sl": sl_val, "trail": trail_val, "risk": risk_val})
+            if result: s.execute(text("UPDATE notes SET initial_sl=:s, trailing_sl=:t, max_risk_pct=:r WHERE trade_id=:tid"), {"s": sl_val, "t": trail_val, "r": risk_val, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, initial_sl, trailing_sl, max_risk_pct) VALUES (:tid, :s, :t, :r)"), {"tid": tid, "s": sl_val, "t": trail_val, "r": risk_val})
             s.commit()
 
 def auto_save_discipline():
@@ -134,8 +137,8 @@ def auto_save_discipline():
         new_val = st.session_state[f"disc_{tid}"]
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET discipline=:val WHERE trade_id=:tid"), {"val": new_val, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :val)"), {"tid": tid, "val": new_val})
+            if result: s.execute(text("UPDATE notes SET discipline=:v WHERE trade_id=:tid"), {"v": new_val, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :v)"), {"tid": tid, "v": new_val})
             s.commit()
 
 def auto_save_note():
@@ -144,8 +147,8 @@ def auto_save_note():
         new_note = st.session_state[f"note_{tid}"]
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET note=:note WHERE trade_id=:tid"), {"note": new_note, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :note)"), {"tid": tid, "note": new_note})
+            if result: s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": new_note, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :n)"), {"tid": tid, "n": new_note})
             s.commit()
 
 def auto_save_market_note():
@@ -153,7 +156,7 @@ def auto_save_market_note():
         m_date = st.session_state.current_market_date
         new_note = st.session_state[f"mkt_note_{m_date}"]
         with conn.session as s:
-            s.execute(text("INSERT INTO market_notes (date, note) VALUES (:date, :note) ON CONFLICT (date) DO UPDATE SET note = EXCLUDED.note"), {"date": m_date, "note": new_note})
+            s.execute(text("INSERT INTO market_notes (date, note) VALUES (:d, :n) ON CONFLICT (date) DO UPDATE SET note = EXCLUDED.note"), {"d": m_date, "n": new_note})
             s.commit()
 
 def auto_save_pre_plan():
@@ -162,18 +165,8 @@ def auto_save_pre_plan():
         new_plan = st.session_state[f"pre_plan_{tid}"]
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET pre_plan=:plan WHERE trade_id=:tid"), {"plan": new_plan, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :plan)"), {"tid": tid, "plan": new_plan})
-            s.commit()
-
-def auto_save_market_cond():
-    if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        new_cond = st.session_state[f"market_cond_{tid}"]
-        with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET market_cond=:cond WHERE trade_id=:tid"), {"cond": new_cond, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, market_cond) VALUES (:tid, :cond)"), {"tid": tid, "cond": new_cond})
+            if result: s.execute(text("UPDATE notes SET pre_plan=:p WHERE trade_id=:tid"), {"p": new_plan, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :p)"), {"tid": tid, "p": new_plan})
             s.commit()
 
 def save_trade_strategy():
@@ -188,15 +181,15 @@ def migrate_open_trade_data(symbol, new_closed_tid):
     old_tid = f"OPEN_{symbol}"
     with conn.session as s:
         if not s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": new_closed_tid}).fetchone():
-            s.execute(text("UPDATE notes SET trade_id=:new_tid WHERE trade_id=:old_tid"), {"new_tid": new_closed_tid, "old_tid": old_tid})
+            s.execute(text("UPDATE notes SET trade_id=:n WHERE trade_id=:o"), {"n": new_closed_tid, "o": old_tid})
         if not s.execute(text("SELECT 1 FROM trade_strategy_map WHERE trade_id=:tid"), {"tid": new_closed_tid}).fetchone():
-            s.execute(text("UPDATE trade_strategy_map SET trade_id=:new_tid WHERE trade_id=:old_tid"), {"new_tid": new_closed_tid, "old_tid": old_tid})
+            s.execute(text("UPDATE trade_strategy_map SET trade_id=:n WHERE trade_id=:o"), {"n": new_closed_tid, "o": old_tid})
         if not s.execute(text("SELECT 1 FROM trade_images WHERE trade_id=:tid"), {"tid": new_closed_tid}).fetchone():
-            s.execute(text("UPDATE trade_images SET trade_id=:new_tid WHERE trade_id=:old_tid"), {"new_tid": new_closed_tid, "old_tid": old_tid})
+            s.execute(text("UPDATE trade_images SET trade_id=:n WHERE trade_id=:o"), {"n": new_closed_tid, "o": old_tid})
         s.commit()
 
 # ==========================================
-# 👉 100% 保留你的原始繪圖與計算邏輯 (一字不改)
+# 👉 100% 原始繪圖與計算邏輯 (一字不漏還原)
 # ==========================================
 def draw_tv_chart(symbol, transactions, initial_sl=0.0):
     try:
@@ -458,18 +451,19 @@ def load_data(file):
 
 init_db()
 
+
 # ==========================================
 # 👉 雙視角：管理員解鎖區塊 (密碼: 0000)
 # ==========================================
-with st.sidebar.expander("🔐 管理員解鎖", expanded=not st.session_state.get('is_admin', False)):
+with st.sidebar.expander("🔐 管理員專屬解鎖", expanded=not st.session_state.get('is_admin', False)):
     if st.session_state.get('is_admin', False):
         st.success("✅ 已解鎖！顯示所有歷史交易。")
         if st.button("鎖定 (返回 2026/04/01 以後視角)"):
             st.session_state['is_admin'] = False
             st.rerun()
     else:
-        st.caption("目前為家人視角 (僅顯示 2026/04/01 之後資料)。")
-        pwd = st.text_input("請輸入密碼以解鎖全部資料", type="password")
+        st.caption("公開模式：僅顯示 2026/04/01 之後資料。")
+        pwd = st.text_input("輸入密碼解鎖全部資料", type="password")
         if st.button("解鎖"):
             if pwd == "0000":
                 st.session_state['is_admin'] = True
@@ -483,7 +477,7 @@ with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
     if st.button("確認新增"):
         if new_strat:
             with conn.session as s:
-                try: s.execute(text("INSERT INTO strategy_tags (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": new_strat}); s.commit()
+                try: s.execute(text("INSERT INTO strategy_tags (name) VALUES (:n) ON CONFLICT DO NOTHING"), {"n": new_strat}); s.commit()
                 except Exception: pass
             st.rerun()
 
@@ -495,7 +489,7 @@ with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
             col_s1.write(s_tag)
             if col_s2.button("🗑️", key=f"del_strat_{s_tag}"):
                 with conn.session as s:
-                    s.execute(text("DELETE FROM strategy_tags WHERE name=:name"), {"name": s_tag}); s.commit()
+                    s.execute(text("DELETE FROM strategy_tags WHERE name=:n"), {"n": s_tag}); s.commit()
                 st.rerun()
 
     st.divider()
@@ -559,7 +553,7 @@ else:
         st.sidebar.warning("⚠️ 已退回使用本地預設資料 (Daily_Report.csv)")
 
 if input_df is not None:
-    # 👉 雙模式過濾：若非管理員，只顯示 2026/04/01 之後的資料
+    # 👉 雙模式過濾：若非管理員，只計算 2026/04/01 (含) 之後的資料
     input_df['Date'] = pd.to_datetime(input_df['Date'])
     if not st.session_state.get('is_admin', False):
         cutoff_date = pd.to_datetime('2026-04-01')
@@ -591,7 +585,7 @@ if input_df is not None:
     # --- 計算資本與儀表板 ---
     try:
         cash_df = conn.query("SELECT amount, date FROM cash_flows", ttl=0)
-        # 如果是公開模式，入金流水也過濾掉舊的，確保數字不會跟沒解鎖的交易對不上
+        # 資金池也要跟著日期過濾
         if not cash_df.empty and not st.session_state.get('is_admin', False):
             cash_df['date'] = pd.to_datetime(cash_df['date'])
             cash_df = cash_df[cash_df['date'] >= cutoff_date]
@@ -1082,13 +1076,11 @@ if input_df is not None:
                                 try:
                                     supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
                                     public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
-                                    
                                     with conn.session as s:
                                         s.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'market')"), {"tid": mkt_tid, "path": public_url})
                                         s.commit()
                                     changed = True
-                                except Exception as e:
-                                    st.error(f"上傳失敗: {e}")
+                                except Exception as e: st.error(f"上傳失敗: {e}")
                             if changed: st.rerun()
 
                     with paste_col:
@@ -1098,28 +1090,23 @@ if input_df is not None:
                             img_hash = hashlib.md5(pasted_img.image_data.tobytes()).hexdigest()
                             if st.session_state.get(f"last_hash_{mkt_tid}") != img_hash:
                                 file_name = f"{mkt_tid}_{uuid.uuid4().hex[:8]}.png"
-                                
                                 img_byte_arr = io.BytesIO()
                                 pasted_img.image_data.save(img_byte_arr, format='PNG')
                                 file_bytes = img_byte_arr.getvalue()
-                                
                                 try:
                                     supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
                                     public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
-                                    
                                     with conn.session as s:
                                         s.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'market')"), {"tid": mkt_tid, "path": public_url})
                                         s.commit()
                                     st.session_state[f"last_hash_{mkt_tid}"] = img_hash
                                     st.rerun()
-                                except Exception as e:
-                                    st.error(f"貼上上傳失敗: {e}")
+                                except Exception as e: st.error(f"貼上上傳失敗: {e}")
 
                 elif view_mode == 'trade' and 'current_trade' in st.session_state:
                     s = st.session_state.current_trade; tid = s['trade_id']
 
                     head_col1, head_col2 = st.columns([2, 1])
-                    
                     if "OPEN_" in tid:
                         with head_col1: st.subheader(f"📝 盤前與持倉追蹤: {s['Symbol']}")
                     else:
@@ -1160,24 +1147,18 @@ if input_df is not None:
                     with st.spinner("正在取得報價與渲染圖表..."):
                         transactions_history = s.get('transactions', [])
                         tv_chart = draw_tv_chart(s['Symbol'], transactions_history, initial_sl=initial_sl_db)
-                        
-                        if tv_chart is None:
-                            st.warning(f"無法從 Yahoo 獲取 {s['Symbol']} 的歷史報價。請確認代號。")
-                        elif isinstance(tv_chart, str):
-                            st.error(f"圖表載入失敗: {tv_chart}")
-                        else:
-                            tv_chart.load()
+                        if tv_chart is None: st.warning(f"無法從 Yahoo 獲取 {s['Symbol']} 的歷史報價。請確認代號。")
+                        elif isinstance(tv_chart, str): st.error(f"圖表載入失敗: {tv_chart}")
+                        else: tv_chart.load()
                     st.divider()
 
                     left_main_col, right_main_col = st.columns([6, 1])
 
                     with left_main_col:
                         text_col1, text_col2 = st.columns(2)
-                        
                         with text_col1:
                             st.markdown("##### 🏹 盤前規劃")
                             st.text_area("記錄進場前的想法...", value=pre_plan_db, height=130, key=f"pre_plan_{tid}", on_change=auto_save_pre_plan, label_visibility="collapsed")
-
                         with text_col2:
                             st.markdown("##### 📝 交易檢討")
                             st.text_area("撰寫心得紀錄 (自動存檔)...", value=note_db, height=130, key=f"note_{tid}", on_change=auto_save_note, label_visibility="collapsed")
@@ -1192,47 +1173,19 @@ if input_df is not None:
                                     img_html = f'''
                                     <style>
                                         .review-zoom-box {{
-                                            width: 100%;
-                                            height: 220px; 
-                                            display: flex;
-                                            justify-content: center;
-                                            align-items: center;
-                                            overflow: hidden;
-                                            background-color: #f8f9fa;
-                                            border-radius: 6px;
-                                            border: 1px solid #e0e3eb;
-                                            cursor: zoom-in;
+                                            width: 100%; height: 220px; display: flex; justify-content: center; align-items: center; overflow: hidden;
+                                            background-color: #f8f9fa; border-radius: 6px; border: 1px solid #e0e3eb; cursor: zoom-in;
                                         }}
-                                        .review-zoom-box img {{
-                                            max-width: 100%;
-                                            max-height: 100%;
-                                            object-fit: contain;
-                                        }}
-                                        img:fullscreen {{
-                                            max-width: 100% !important;
-                                            max-height: 100% !important;
-                                            object-fit: contain !important;
-                                            background-color: #000000 !important;
-                                        }}
+                                        .review-zoom-box img {{ max-width: 100%; max-height: 100%; object-fit: contain; }}
+                                        img:fullscreen {{ max-width: 100% !important; max-height: 100% !important; object-fit: contain !important; background-color: #000000 !important; }}
                                     </style>
-                                    
-                                    <div class="review-zoom-box">
-                                        <img src="{g_url}" title="連點兩下全螢幕放大" ondblclick="toggleFullscreen(this)">
-                                    </div>
-
+                                    <div class="review-zoom-box"><img src="{g_url}" title="連點兩下全螢幕放大" ondblclick="toggleFullscreen(this)"></div>
                                     <script>
                                         function toggleFullscreen(elem) {{
                                             if (!document.fullscreenElement) {{
-                                                if (elem.requestFullscreen) {{
-                                                    elem.requestFullscreen();
-                                                }} else if (elem.webkitRequestFullscreen) {{ 
-                                                    elem.webkitRequestFullscreen();
-                                                }}
-                                            }} else {{
-                                                if (document.exitFullscreen) {{
-                                                    document.exitFullscreen();
-                                                }}
-                                            }}
+                                                if (elem.requestFullscreen) {{ elem.requestFullscreen();
+                                                }} else if (elem.webkitRequestFullscreen) {{ elem.webkitRequestFullscreen(); }}
+                                            }} else {{ if (document.exitFullscreen) {{ document.exitFullscreen(); }} }}
                                         }}
                                     </script>
                                     '''
@@ -1252,68 +1205,51 @@ if input_df is not None:
                             img_hash = hashlib.md5(pasted_img.image_data.tobytes()).hexdigest()
                             if st.session_state.get(f"last_hash_{tid}") != img_hash:
                                 file_name = f"{tid}_{uuid.uuid4().hex[:8]}.png"
-                                
                                 img_byte_arr = io.BytesIO()
                                 pasted_img.image_data.save(img_byte_arr, format='PNG')
                                 file_bytes = img_byte_arr.getvalue()
-
                                 try:
                                     supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
                                     public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
-                                    
                                     with conn.session as sq:
                                         sq.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'general')"), {"tid": tid, "path": public_url})
                                         sq.commit()
                                     st.session_state[f"last_hash_{tid}"] = img_hash
                                     st.rerun()
-                                except Exception as e:
-                                    st.error(f"貼上上傳失敗: {e}")
+                                except Exception as e: st.error(f"貼上上傳失敗: {e}")
 
                         st.info("💡 內容將在您停止輸入或切換頁面時自動儲存。")
 
                     with right_main_col:
                         st.markdown("##### 🛡️ 風險與部位控管")
-                        
                         buys = [t for t in s.get('transactions', []) if t['type'] == 'Buy']
                         total_buy_qty = sum(t['qty'] for t in buys)
                         total_buy_cost = sum(t['price'] * t['qty'] for t in buys)
                         avg_buy_price = total_buy_cost / total_buy_qty if total_buy_qty > 0 else 0
-                        
                         st.caption(f"當前動態總資金: ${current_capital:,.0f}")
                         st.caption(f"平均買進成本: ${avg_buy_price:.2f}")
 
                         sl_col1, sl_col2 = st.columns(2)
-                        with sl_col1:
-                            new_sl = st.number_input("初始停損點 ($)", min_value=0.0, value=float(initial_sl_db), step=0.1, key=f"sl_{tid}", on_change=auto_save_risk_params)
-                        with sl_col2:
-                            new_trail = st.number_input("追蹤止損點 ($)", min_value=0.0, value=float(trailing_sl_db), step=0.1, key=f"trail_{tid}", on_change=auto_save_risk_params)
+                        with sl_col1: new_sl = st.number_input("初始停損點 ($)", min_value=0.0, value=float(initial_sl_db), step=0.1, key=f"sl_{tid}", on_change=auto_save_risk_params)
+                        with sl_col2: new_trail = st.number_input("追蹤止損點 ($)", min_value=0.0, value=float(trailing_sl_db), step=0.1, key=f"trail_{tid}", on_change=auto_save_risk_params)
                             
                         risk_options = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
                         default_risk_index = risk_options.index(max_risk_pct_db) if max_risk_pct_db in risk_options else 3
                         new_risk = st.selectbox("每筆最大損失 (%)", options=risk_options, index=default_risk_index, key=f"risk_{tid}", on_change=auto_save_risk_params)
 
-                        sl_pct = 0.0
-                        actual_pos_size_pct = 0.0
-                        actual_position_dollar = total_buy_cost
-                        actual_risk_dollar = 0.0
-                        actual_risk_pct = 0.0
-                        r_multiple = 0.0
+                        sl_pct = 0.0; actual_pos_size_pct = 0.0; actual_position_dollar = total_buy_cost
+                        actual_risk_dollar = 0.0; actual_risk_pct = 0.0; r_multiple = 0.0
 
-                        if current_capital > 0:
-                            actual_pos_size_pct = (actual_position_dollar / current_capital) * 100
-
+                        if current_capital > 0: actual_pos_size_pct = (actual_position_dollar / current_capital) * 100
                         if avg_buy_price > 0 and new_sl > 0:
                             sl_dist = avg_buy_price - new_sl 
                             sl_pct = (sl_dist / avg_buy_price) * 100
-                            
                             if sl_pct > 0:
                                 actual_risk_dollar = sl_dist * total_buy_qty
-                                if current_capital > 0:
-                                    actual_risk_pct = (actual_risk_dollar / current_capital) * 100
+                                if current_capital > 0: actual_risk_pct = (actual_risk_dollar / current_capital) * 100
 
                         actual_pnl = s.get('pnl', 0)
-                        if actual_risk_dollar > 0 and actual_pnl != 0:
-                            r_multiple = actual_pnl / actual_risk_dollar
+                        if actual_risk_dollar > 0 and actual_pnl != 0: r_multiple = actual_pnl / actual_risk_dollar
 
                         with st.container(border=True):
                             st.metric("實際總資金占比", f"{actual_pos_size_pct:.2f}%")
@@ -1323,19 +1259,14 @@ if input_df is not None:
                             if sl_pct > 0:
                                 st.divider()
                                 st.metric("建倉初始風險 %", f"{actual_risk_pct:.2f}%", delta=f"設定上限: {new_risk}%", delta_color="off")
-                                
                                 active_stop = new_trail if new_trail > 0 else new_sl
                                 locked_pnl = (active_stop - avg_price) * total_buy_qty
                                 
-                                if locked_pnl >= 0:
-                                    st.metric("若觸價將鎖定利潤", f"${locked_pnl:,.0f}", delta="已保本/獲利", delta_color="normal")
-                                else:
-                                    st.metric("若觸價將面臨虧損", f"${locked_pnl:,.0f}", delta="風險仍在", delta_color="inverse")
+                                if locked_pnl >= 0: st.metric("若觸價將鎖定利潤", f"${locked_pnl:,.0f}", delta="已保本/獲利", delta_color="normal")
+                                else: st.metric("若觸價將面臨虧損", f"${locked_pnl:,.0f}", delta="風險仍在", delta_color="inverse")
                                 
-                                if actual_pos_size_pct > 100:
-                                    st.error("⚠️ 實際倉位超過 100%，請確認是否過度使用槓桿。")
-                                if actual_risk_pct > new_risk:
-                                    st.warning(f"⚠️ 建倉實際風險 ({actual_risk_pct:.2f}%) 已超出單筆上限 ({new_risk}%)！")
+                                if actual_pos_size_pct > 100: st.error("⚠️ 實際倉位超過 100%，請確認是否過度使用槓桿。")
+                                if actual_risk_pct > new_risk: st.warning(f"⚠️ 建倉實際風險 ({actual_risk_pct:.2f}%) 已超出單筆上限 ({new_risk}%)！")
                             else:
                                 st.divider()
                                 st.metric("初始停損與風險", "請輸入有效的停損點")
@@ -1346,20 +1277,14 @@ if input_df is not None:
                             st.metric("實現 R 倍數", f"{r_multiple:.2f} R", delta=f"{r_multiple:.2f}", delta_color=r_color)
 
                     st.divider()
-
                     st.markdown("##### 📋 規劃圖附件")
                     
                     if not pre_plan_imgs.empty:
                         for _, p_row in pre_plan_imgs.iterrows():
                             p_url = p_row['image_path']
                             with st.container(border=True):
-                                img_html = f'''
-                                <div style="width: 100%; display: flex; justify-content: center; align-items: flex-start;">
-                                    <img src="{p_url}" style="width: 100%; max-height: 320px; object-fit: contain; border-radius: 5px;">
-                                </div>
-                                '''
+                                img_html = f'<div style="width: 100%; display: flex; justify-content: center; align-items: flex-start;"><img src="{p_url}" style="width: 100%; max-height: 320px; object-fit: contain; border-radius: 5px;"></div>'
                                 st.markdown(img_html, unsafe_allow_html=True)
-
                             if st.button("🗑️ 刪除", key=f"del_pre_{p_url}"):
                                 with conn.session as sq:
                                     sq.execute(text("DELETE FROM trade_images WHERE image_path=:path"), {"path": p_url})
@@ -1367,30 +1292,25 @@ if input_df is not None:
                                 file_name = p_url.split('/')[-1]
                                 supabase.storage.from_(STORAGE_BUCKET).remove([file_name])
                                 st.rerun()
-                    else:
-                        st.caption("尚未貼上規劃圖")
+                    else: st.caption("尚未貼上規劃圖")
                     
                     p_paste = paste_image_button("貼上", key=f"pp_paste_{tid}")
                     if p_paste and p_paste.image_data is not None:
                         p_hash = hashlib.md5(p_paste.image_data.tobytes()).hexdigest()
                         if st.session_state.get(f"pp_hash_{tid}") != p_hash:
                             file_name = f"PP_{tid}_{uuid.uuid4().hex[:5]}.png"
-                            
                             img_byte_arr = io.BytesIO()
                             p_paste.image_data.save(img_byte_arr, format='PNG')
                             file_bytes = img_byte_arr.getvalue()
-
                             try:
                                 supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
                                 public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
-                                
                                 with conn.session as sq:
                                     sq.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'pre_plan')"), {"tid": tid, "path": public_url})
                                     sq.commit()
                                 st.session_state[f"pp_hash_{tid}"] = p_hash
                                 st.rerun()
-                            except Exception as e:
-                                st.error(f"貼上上傳失敗: {e}")
+                            except Exception as e: st.error(f"貼上上傳失敗: {e}")
                 else: st.info("請點擊左側標的進行詳細檢討。")
 else:
     st.title("📈 交易數據中心")
