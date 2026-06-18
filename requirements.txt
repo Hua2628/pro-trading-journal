@@ -2,7 +2,10 @@ streamlit
 pandas
 numpy
 plotly
-yfinance
-lightweight-charts==1.0.21
 streamlit-paste-button
+yfinance
+lightweight-charts
 requests
+sqlalchemy
+supabase
+psycopg2-binary
