@@ -731,14 +731,23 @@ if input_df is not None:
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
+# 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
         with tab_equity:
-            trade_history = display_df.groupby('Exit_Date')['pnl'].sum().reset_index() if not display_df.empty else pd.DataFrame(columns=['Exit_Date', 'pnl'])
+            # ✅ 1. 為了讓淨值完美銜接，強制重新獲取「全時段」的原始交易紀錄來算
+            full_t_df, _ = calculate_perfect_chartlog_stats(input_df)
+            
+            if full_t_df is not None and not full_t_df.empty:
+                trade_history = full_t_df.groupby('Exit_Date')['pnl'].sum().reset_index()
+            else:
+                trade_history = pd.DataFrame(columns=['Exit_Date', 'pnl'])
+                
             trade_history.rename(columns={'Exit_Date': 'Date', 'pnl': 'Amount'}, inplace=True)
             trade_history['Type'] = 'TradePnL'
 
-            # ✅ 採用專屬雲端 PostgreSQL 的讀取方式
+            # ✅ 2. 解決 PostgreSQL 大小寫地雷：用 pandas 強制賦予大寫欄位名稱
             try:
-                cash_history = conn.query("SELECT date as Date, amount as Amount FROM cash_flows", ttl=0)
+                cash_history = conn.query("SELECT date, amount FROM cash_flows", ttl=0)
+                cash_history.rename(columns={'date': 'Date', 'amount': 'Amount'}, inplace=True)
             except Exception:
                 cash_history = pd.DataFrame(columns=['Date', 'Amount'])
             cash_history['Type'] = 'CashFlow'
@@ -748,9 +757,11 @@ if input_df is not None:
             if not merged_timeline.empty:
                 merged_timeline = merged_timeline.dropna(subset=['Date'])
                 merged_timeline['Date'] = pd.to_datetime(merged_timeline['Date'])
-                merged_timeline = merged_timeline.sort_values('Date').reset_index(drop=True)
+                
+                # 確保同一天先算入金，再算損益，淨值才不會暴走
+                merged_timeline['Type_Sort'] = merged_timeline['Type'].map({'CashFlow': 0, 'TradePnL': 1})
+                merged_timeline = merged_timeline.sort_values(['Date', 'Type_Sort']).reset_index(drop=True)
 
-                # ✅ 完全保留你原本精準的 NAV 算法，一字不改！
                 current_balance = 0.0
                 current_shares = 0.0
                 nav = 1.0
@@ -777,7 +788,7 @@ if input_df is not None:
                         'Date': row['Date'],
                         'Real_Balance': current_balance,
                         'NAV': nav,
-                        'Cum_Return_Pct': (nav - 1) * 100  # 💡 唯一新增：把 NAV 轉換成累積報酬率 %
+                        'Cum_Return_Pct': (nav - 1) * 100
                     })
 
                 if 'unrealized_pnl' in locals() and unrealized_pnl != 0:
@@ -792,50 +803,53 @@ if input_df is not None:
                         'Cum_Return_Pct': (nav - 1) * 100
                     })
 
-                st.session_state['current_capital'] = current_balance
-
-                # 🎨 繪製全新高質感：時間加權累積報酬率折線圖
                 nav_df = pd.DataFrame(history_timeline)
-                import plotly.graph_objects as go
-                import numpy as np
                 
-                fig = go.Figure()
-                
-                fig.add_trace(
-                    go.Scatter(
-                        x=nav_df['Date'], 
-                        y=nav_df['Cum_Return_Pct'], 
-                        name="累積報酬率 (%)", 
-                        mode='lines+markers',
-                        line=dict(color='#A0AAB5', width=2), # 中性質感灰色引導線
-                        marker=dict(
-                            size=8,
-                            # 💡 智慧變色：大於等於 0% 顯示綠色，小於 0% 顯示紅色
-                            color=np.where(nav_df['Cum_Return_Pct'] >= 0, '#089981', '#f23645'),
-                            line=dict(width=1.5, color='white')
-                        ),
-                        hovertemplate='日期: %{x|%Y-%m-%d}<br>累積報酬率: <b>%{y:.2f}%</b><extra></extra>'
+                # ✅ 3. 底層算完最真實的 NAV 後，再依照公開模式把舊資料隱藏
+                if not st.session_state.get('is_admin', False):
+                    cutoff_date = pd.to_datetime('2026-04-01')
+                    nav_df = nav_df[nav_df['Date'] >= cutoff_date]
+
+                if not nav_df.empty:
+                    import plotly.graph_objects as go
+                    import numpy as np
+                    
+                    fig = go.Figure()
+                    
+                    fig.add_trace(
+                        go.Scatter(
+                            x=nav_df['Date'], 
+                            y=nav_df['Cum_Return_Pct'], 
+                            name="累積報酬率 (%)", 
+                            mode='lines+markers',
+                            line=dict(color='#A0AAB5', width=2),
+                            marker=dict(
+                                size=8,
+                                color=np.where(nav_df['Cum_Return_Pct'] >= 0, '#089981', '#f23645'),
+                                line=dict(width=1.5, color='white')
+                            ),
+                            hovertemplate='日期: %{x|%Y-%m-%d}<br>累積報酬率: <b>%{y:.2f}%</b><extra></extra>'
+                        )
                     )
-                )
 
-                # 加入 0% 水平基準線
-                fig.add_hline(y=0, line_dash="dash", line_color="#333333", opacity=0.3)
+                    fig.add_hline(y=0, line_dash="dash", line_color="#333333", opacity=0.3)
 
-                fig.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    hovermode="x unified",
-                    xaxis_title="",
-                    yaxis_title="時間加權累積報酬率 (%)",
-                    margin=dict(l=0, r=0, t=30, b=0),
-                    showlegend=False
-                )
-                fig.update_yaxes(showgrid=True, gridcolor='#e0e3eb', zeroline=False)
-                fig.update_xaxes(showgrid=False)
+                    fig.update_layout(
+                        plot_bgcolor='rgba(0,0,0,0)',
+                        hovermode="x unified",
+                        xaxis_title="",
+                        yaxis_title="時間加權累積報酬率 (%)",
+                        margin=dict(l=0, r=0, t=30, b=0),
+                        showlegend=False
+                    )
+                    fig.update_yaxes(showgrid=True, gridcolor='#e0e3eb', zeroline=False)
+                    fig.update_xaxes(showgrid=False)
 
-                st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("該區間內尚無資金曲線數據。")
             else:
                 st.info("尚無入金或交易資料可繪製資金曲線。")
-                st.session_state['current_capital'] = 0.0
         with tab_daily:
             if not display_df.empty:
                 daily_pnl = display_df.groupby('Exit_Date')['pnl'].sum().reset_index()
