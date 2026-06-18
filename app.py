@@ -872,11 +872,14 @@ if input_df is not None:
                             if st.button(f"🌍 檢視 {d} 大盤市況", key=f"btn_mkt_{d}", use_container_width=True):
                                 st.session_state.view_mode = "market"; st.session_state.current_market_date = d
 
+                            # ✅ 防撞名強化版寫法
                             items = display_df[display_df['Exit_Date'] == d]
-                            for _, item in items.iterrows():
+                            for idx, item in items.iterrows():  # 💡 1. 把原本的底線 _ 改成 idx，抓出專屬流水號
                                 tag_str = f"[{item['strategy_name']}] " if item['strategy_name'] != "未分類" else ""
                                 status_icon = "🟢" if item['pnl'] > 0 else ("🔴" if item['pnl'] < 0 else "⚪")
-                                if st.button(f"{status_icon} {tag_str}{item['Symbol']} | ${item['pnl']:,.2f}", key=item['trade_id']):
+                                
+                                # 💡 2. 在 key 後面補上 _{idx}，讓每顆按鈕獲得絕對獨一無二的身分證
+                                if st.button(f"{status_icon} {tag_str}{item['Symbol']} | ${item['pnl']:,.2f}", key=f"{item['trade_id']}_{idx}"):
                                     st.session_state.view_mode = "trade"; st.session_state.current_trade = item.to_dict()
 
         with right:
