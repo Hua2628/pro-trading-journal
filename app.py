@@ -37,7 +37,7 @@ db_url = os.environ.get("CONNECTIONS__POSTGRESQL__URL") or os.environ.get("conne
 if db_url:
     conn = st.connection("postgresql", type="sql", ttl=0, url=db_url)
 else:
-    conn = st.connection("postgresql", type="sql", ttl=0)
+    conn = st.connection("postgresql", type="sql", ttl="1m")
 
 # 同步確保 Supabase 網址與金鑰也能完美讀取
 url_supa: str = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
