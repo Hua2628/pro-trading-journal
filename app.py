@@ -30,9 +30,18 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 雲端資料庫與環境初始化 ---
-conn = st.connection("postgresql", type="sql", ttl=0)
-url_supa: str = st.secrets["SUPABASE_URL"]
-key_supa: str = st.secrets["SUPABASE_KEY"]
+# --- 雲端資料庫與環境初始化 ---
+# 💡 直接從環境變數強制抓取連線字串，直接餵給 st.connection，繞過 Streamlit 的解析盲區
+db_url = os.environ.get("CONNECTIONS__POSTGRESQL__URL") or os.environ.get("connections__postgresql__url")
+
+if db_url:
+    conn = st.connection("postgresql", type="sql", ttl=0, url=db_url)
+else:
+    conn = st.connection("postgresql", type="sql", ttl=0)
+
+# 同步確保 Supabase 網址與金鑰也能完美讀取
+url_supa: str = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL", "")
+key_supa: str = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY", "")
 supabase: Client = create_client(url_supa, key_supa)
 STORAGE_BUCKET = "trade_images"
 
