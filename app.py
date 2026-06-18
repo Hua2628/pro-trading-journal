@@ -732,8 +732,9 @@ if input_df is not None:
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
+# 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
         with tab_equity:
-            # ✅ 1. 為了讓淨值完美銜接，強制重新獲取「全時段」的原始交易紀錄來算
+            # 1. 為了讓淨值完美銜接，強制重新獲取「全時段」的原始交易紀錄來算
             full_t_df, _ = calculate_perfect_chartlog_stats(input_df)
             
             if full_t_df is not None and not full_t_df.empty:
@@ -744,7 +745,7 @@ if input_df is not None:
             trade_history.rename(columns={'Exit_Date': 'Date', 'pnl': 'Amount'}, inplace=True)
             trade_history['Type'] = 'TradePnL'
 
-            # ✅ 2. 解決 PostgreSQL 大小寫地雷：用 pandas 強制賦予大寫欄位名稱
+            # 2. 解決 PostgreSQL 大小寫地雷：用 pandas 強制賦予大寫欄位名稱
             try:
                 cash_history = conn.query("SELECT date, amount FROM cash_flows", ttl=0)
                 cash_history.rename(columns={'date': 'Date', 'amount': 'Amount'}, inplace=True)
@@ -805,34 +806,94 @@ if input_df is not None:
 
                 nav_df = pd.DataFrame(history_timeline)
                 
-                # ✅ 3. 底層算完最真實的 NAV 後，再依照公開模式把舊資料隱藏
+                # ✅ 3. 公開模式：隱藏舊資料，並「重新定錨 (Rebase)」從 0% 開始
                 if not st.session_state.get('is_admin', False):
                     cutoff_date = pd.to_datetime('2026-04-01')
-                    nav_df = nav_df[nav_df['Date'] >= cutoff_date]
+                    nav_df = nav_df[nav_df['Date'] >= cutoff_date].copy()
+                    
+                    # 💡 重新定錨：把大眾模式看到的第一天當作淨值 1.0 (起點歸零)
+                    if not nav_df.empty:
+                        base_nav = nav_df.iloc[0]['NAV']
+                        if base_nav > 0:
+                            nav_df['NAV'] = nav_df['NAV'] / base_nav
+                            nav_df['Cum_Return_Pct'] = (nav_df['NAV'] - 1) * 100
 
                 if not nav_df.empty:
                     import plotly.graph_objects as go
                     import numpy as np
                     
+                    x_vals = nav_df['Date'].tolist()
+                    y_vals = nav_df['Cum_Return_Pct'].tolist()
+
+                    up_x, up_y = [], []
+                    down_x, down_y = [], []
+
+                    # ✅ 4. IBKR 風格：看「斜率」決定紅綠色
+                    for i in range(1, len(x_vals)):
+                        x0, x1 = x_vals[i-1], x_vals[i]
+                        y0, y1 = y_vals[i-1], y_vals[i]
+
+                        if y1 >= y0:
+                            # 只要往上走就是綠色
+                            up_x.extend([x0, x1, None])
+                            up_y.extend([y0, y1, None])
+                        else:
+                            # 只要往下掉就是紅色
+                            down_x.extend([x0, x1, None])
+                            down_y.extend([y0, y1, None])
+
                     fig = go.Figure()
-                    
+
+                    # 加入淡淡的背景填充 (模仿 IB 的視覺深度)
                     fig.add_trace(
                         go.Scatter(
-                            x=nav_df['Date'], 
-                            y=nav_df['Cum_Return_Pct'], 
-                            name="累積報酬率 (%)", 
-                            mode='lines+markers',
-                            line=dict(color='#A0AAB5', width=2),
-                            marker=dict(
-                                size=8,
-                                color=np.where(nav_df['Cum_Return_Pct'] >= 0, '#089981', '#f23645'),
-                                line=dict(width=1.5, color='white')
-                            ),
-                            hovertemplate='日期: %{x|%Y-%m-%d}<br>累積報酬率: <b>%{y:.2f}%</b><extra></extra>'
+                            x=x_vals, y=y_vals,
+                            mode='lines',
+                            line=dict(color='rgba(0,0,0,0)', width=0),
+                            fill='tozeroy',
+                            fillcolor='rgba(8, 153, 129, 0.05)',
+                            showlegend=False,
+                            hoverinfo='skip'
                         )
                     )
 
-                    fig.add_hline(y=0, line_dash="dash", line_color="#333333", opacity=0.3)
+                    # 加入 0% 水平基準虛線
+                    fig.add_hline(y=0, line_dash="dot", line_color="#888888", line_width=1.5, opacity=0.8)
+
+                    # 繪製上漲段 (綠色)
+                    if up_x:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=up_x, y=up_y,
+                                mode='lines',
+                                line=dict(color='#089981', width=2.5),
+                                showlegend=False,
+                                hoverinfo='skip'
+                            )
+                        )
+
+                    # 繪製下跌段 (紅色)
+                    if down_x:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=down_x, y=down_y,
+                                mode='lines',
+                                line=dict(color='#f23645', width=2.5),
+                                showlegend=False,
+                                hoverinfo='skip'
+                            )
+                        )
+
+                    # 加入隱形節點來觸發 Hover 資訊 (拿掉礙眼的圓點)
+                    fig.add_trace(
+                        go.Scatter(
+                            x=x_vals, y=y_vals,
+                            mode='markers',
+                            marker=dict(size=4, color='rgba(0,0,0,0)'),
+                            showlegend=False,
+                            hovertemplate='日期: %{x|%Y-%m-%d}<br>累積報酬率: <b>%{y:.2f}%</b><extra></extra>'
+                        )
+                    )
 
                     fig.update_layout(
                         plot_bgcolor='rgba(0,0,0,0)',
