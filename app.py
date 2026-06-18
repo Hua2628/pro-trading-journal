@@ -728,61 +728,114 @@ if input_df is not None:
                 else: st.info("尚無數據可繪製趨勢圖。")
             else: st.info("目前尚無已平倉的交易可供統計。")
 
+# 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
         with tab_equity:
             trade_history = display_df.groupby('Exit_Date')['pnl'].sum().reset_index() if not display_df.empty else pd.DataFrame(columns=['Exit_Date', 'pnl'])
             trade_history.rename(columns={'Exit_Date': 'Date', 'pnl': 'Amount'}, inplace=True)
             trade_history['Type'] = 'TradePnL'
 
+            conn = sqlite3.connect(DB_NAME)
             try:
-                cash_history = cash_df.copy()
-                cash_history.rename(columns={'date': 'Date', 'amount': 'Amount'}, inplace=True)
+                cash_history = pd.read_sql("SELECT date as Date, amount as Amount FROM cash_flows", conn)
             except Exception:
                 cash_history = pd.DataFrame(columns=['Date', 'Amount'])
-                
+            conn.close()
             cash_history['Type'] = 'CashFlow'
 
             merged_timeline = pd.concat([trade_history, cash_history], ignore_index=True)
+            
             if not merged_timeline.empty:
                 merged_timeline = merged_timeline.dropna(subset=['Date'])
                 merged_timeline['Date'] = pd.to_datetime(merged_timeline['Date'])
-                merged_timeline = merged_timeline.sort_values('Date').reset_index(drop=True)
+                
+                # 💡 將同一天的 PnL 與 CashFlow 合併處理
+                daily_summary = merged_timeline.groupby(['Date', 'Type'])['Amount'].sum().unstack(fill_value=0.0).reset_index()
+                
+                # 確保欄位存在
+                if 'TradePnL' not in daily_summary.columns: daily_summary['TradePnL'] = 0.0
+                if 'CashFlow' not in daily_summary.columns: daily_summary['CashFlow'] = 0.0
+                    
+                daily_summary = daily_summary.sort_values('Date').reset_index(drop=True)
 
-                current_balance, current_shares, nav = 0.0, 0.0, 1.0
+                current_balance = 0.0
+                cum_return_index = 1.0 # 時間加權指數基底
                 history_timeline = []
 
-                for _, row in merged_timeline.iterrows():
-                    val = float(row['Amount']) if pd.notnull(row['Amount']) else 0.0
-                    if row['Type'] == 'CashFlow':
-                        if current_balance == 0: current_shares = val; current_balance = val
-                        else:
-                            if nav > 0: current_shares += (val / nav)
-                            current_balance += val
-                    elif row['Type'] == 'TradePnL':
-                        current_balance += val
-                        if current_shares > 0: nav = current_balance / current_shares
+                # 💡 核心算法：時間加權報酬率 (TWR)
+                for _, row in daily_summary.iterrows():
+                    date = row['Date']
+                    pnl = float(row['TradePnL'])
+                    cf = float(row['CashFlow'])
+                    
+                    # 1. 先計算當日報酬率 (不受當日入金影響)
+                    if current_balance > 0:
+                        day_return = pnl / current_balance
+                        cum_return_index *= (1 + day_return)
+                    
+                    # 2. 結算當日最終餘額 (包含 PnL 與資金異動)
+                    current_balance += (pnl + cf)
+                    
+                    history_timeline.append({
+                        'Date': date,
+                        'Cum_Return_Pct': (cum_return_index - 1) * 100,
+                        'Balance': current_balance
+                    })
 
-                    history_timeline.append({'Date': row['Date'], 'Real_Balance': current_balance, 'NAV': nav})
-
+                # 加入今日的未實現損益 (Unrealized PnL)
                 if 'unrealized_pnl' in locals() and unrealized_pnl != 0:
+                    if current_balance > 0:
+                        today_return = unrealized_pnl / current_balance
+                        cum_return_index *= (1 + today_return)
+                    
                     current_balance += unrealized_pnl
-                    if current_shares > 0: nav = current_balance / current_shares
-                    history_timeline.append({'Date': pd.Timestamp.now().normalize(), 'Real_Balance': current_balance, 'NAV': nav})
+                    
+                    history_timeline.append({
+                        'Date': pd.Timestamp.now().normalize(),
+                        'Cum_Return_Pct': (cum_return_index - 1) * 100,
+                        'Balance': current_balance
+                    })
 
-                st.session_state['current_capital'] = current_balance
                 nav_df = pd.DataFrame(history_timeline)
-                
                 import plotly.graph_objects as go
-                from plotly.subplots import make_subplots
-                fig = make_subplots(specs=[[{"secondary_y": True}]])
-                fig.add_trace(go.Scatter(x=nav_df['Date'], y=nav_df['Real_Balance'], name="真實總資金 ($)", line=dict(color='#2E86C1', width=3), mode='lines+markers'), secondary_y=False)
-                fig.add_trace(go.Scatter(x=nav_df['Date'], y=nav_df['NAV'], name="單位淨值 (NAV)", line=dict(color='#E67E22', width=3), mode='lines+markers'), secondary_y=True)
-                fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                fig.update_yaxes(title_text="真實金額 (USD)", secondary_y=False, showgrid=True, gridcolor='lightgray')
-                fig.update_yaxes(title_text="交易實力淨值 (NAV)", secondary_y=True, showgrid=False)
+                import numpy as np
+                
+                fig = go.Figure()
+                
+                # 繪製 TWR 折線圖 (動態紅綠節點)
+                fig.add_trace(
+                    go.Scatter(
+                        x=nav_df['Date'], 
+                        y=nav_df['Cum_Return_Pct'], 
+                        name="累積報酬率 (%)", 
+                        mode='lines+markers',
+                        line=dict(color='#A0AAB5', width=2), # 中性灰色引導線
+                        marker=dict(
+                            size=8,
+                            # 💡 大於等於 0 顯示綠色，小於 0 顯示紅色
+                            color=np.where(nav_df['Cum_Return_Pct'] >= 0, '#089981', '#f23645'),
+                            line=dict(width=1.5, color='white')
+                        ),
+                        hovertemplate='日期: %{x|%Y-%m-%d}<br>累積報酬率: <b>%{y:.2f}%</b><extra></extra>'
+                    )
+                )
+
+                # 加入 0% 水平基準線
+                fig.add_hline(y=0, line_dash="dash", line_color="#333333", opacity=0.3)
+
+                fig.update_layout(
+                    plot_bgcolor='rgba(0,0,0,0)',
+                    hovermode="x unified",
+                    xaxis_title="",
+                    yaxis_title="時間加權累積報酬率 (%)",
+                    margin=dict(l=0, r=0, t=30, b=0),
+                    showlegend=False
+                )
+                fig.update_yaxes(showgrid=True, gridcolor='#e0e3eb', zeroline=False)
+                fig.update_xaxes(showgrid=False)
+
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("尚無入金或交易資料可繪製資金曲線。")
-                st.session_state['current_capital'] = 0.0
 
         with tab_daily:
             if not display_df.empty:
