@@ -730,18 +730,13 @@ if input_df is not None:
 
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
+# 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
         with tab_equity:
             trade_history = display_df.groupby('Exit_Date')['pnl'].sum().reset_index() if not display_df.empty else pd.DataFrame(columns=['Exit_Date', 'pnl'])
             trade_history.rename(columns={'Exit_Date': 'Date', 'pnl': 'Amount'}, inplace=True)
             trade_history['Type'] = 'TradePnL'
 
-            # ✅ 直接使用雲端連線讀取，乾淨俐落！
-            try:
-                cash_history = conn.query("SELECT date as Date, amount as Amount FROM cash_flows", ttl=0)
-            except Exception:
-                cash_history = pd.DataFrame(columns=['Date', 'Amount'])
-            cash_history['Type'] = 'CashFlow'
-# ✅ 修正為專屬雲端 PostgreSQL 的讀取方式
+            # ✅ 採用專屬雲端 PostgreSQL 的讀取方式
             try:
                 cash_history = conn.query("SELECT date as Date, amount as Amount FROM cash_flows", ttl=0)
             except Exception:
@@ -753,71 +748,69 @@ if input_df is not None:
             if not merged_timeline.empty:
                 merged_timeline = merged_timeline.dropna(subset=['Date'])
                 merged_timeline['Date'] = pd.to_datetime(merged_timeline['Date'])
-                
-                # 💡 將同一天的 PnL 與 CashFlow 合併處理
-                daily_summary = merged_timeline.groupby(['Date', 'Type'])['Amount'].sum().unstack(fill_value=0.0).reset_index()
-                
-                # 確保欄位存在
-                if 'TradePnL' not in daily_summary.columns: daily_summary['TradePnL'] = 0.0
-                if 'CashFlow' not in daily_summary.columns: daily_summary['CashFlow'] = 0.0
-                    
-                daily_summary = daily_summary.sort_values('Date').reset_index(drop=True)
+                merged_timeline = merged_timeline.sort_values('Date').reset_index(drop=True)
 
+                # ✅ 完全保留你原本精準的 NAV 算法，一字不改！
                 current_balance = 0.0
-                cum_return_index = 1.0 # 時間加權指數基底
+                current_shares = 0.0
+                nav = 1.0
                 history_timeline = []
 
-                # 💡 核心算法：時間加權報酬率 (TWR)
-                for _, row in daily_summary.iterrows():
-                    date = row['Date']
-                    pnl = float(row['TradePnL'])
-                    cf = float(row['CashFlow'])
+                for _, row in merged_timeline.iterrows():
+                    val = float(row['Amount']) if pd.notnull(row['Amount']) else 0.0
                     
-                    # 1. 先計算當日報酬率 (不受當日入金影響)
-                    if current_balance > 0:
-                        day_return = pnl / current_balance
-                        cum_return_index *= (1 + day_return)
-                    
-                    # 2. 結算當日最終餘額 (包含 PnL 與資金異動)
-                    current_balance += (pnl + cf)
-                    
+                    if row['Type'] == 'CashFlow':
+                        if current_balance == 0:
+                            current_shares = val
+                            current_balance = val
+                        else:
+                            if nav > 0:
+                                current_shares += (val / nav)
+                            current_balance += val
+                            
+                    elif row['Type'] == 'TradePnL':
+                        current_balance += val
+                        if current_shares > 0:
+                            nav = current_balance / current_shares
+
                     history_timeline.append({
-                        'Date': date,
-                        'Cum_Return_Pct': (cum_return_index - 1) * 100,
-                        'Balance': current_balance
+                        'Date': row['Date'],
+                        'Real_Balance': current_balance,
+                        'NAV': nav,
+                        'Cum_Return_Pct': (nav - 1) * 100  # 💡 唯一新增：把 NAV 轉換成累積報酬率 %
                     })
 
-                # 加入今日的未實現損益 (Unrealized PnL)
                 if 'unrealized_pnl' in locals() and unrealized_pnl != 0:
-                    if current_balance > 0:
-                        today_return = unrealized_pnl / current_balance
-                        cum_return_index *= (1 + today_return)
-                    
                     current_balance += unrealized_pnl
+                    if current_shares > 0:
+                        nav = current_balance / current_shares
                     
                     history_timeline.append({
                         'Date': pd.Timestamp.now().normalize(),
-                        'Cum_Return_Pct': (cum_return_index - 1) * 100,
-                        'Balance': current_balance
+                        'Real_Balance': current_balance,
+                        'NAV': nav,
+                        'Cum_Return_Pct': (nav - 1) * 100
                     })
 
+                st.session_state['current_capital'] = current_balance
+
+                # 🎨 繪製全新高質感：時間加權累積報酬率折線圖
                 nav_df = pd.DataFrame(history_timeline)
                 import plotly.graph_objects as go
                 import numpy as np
                 
                 fig = go.Figure()
                 
-                # 繪製 TWR 折線圖 (動態紅綠節點)
                 fig.add_trace(
                     go.Scatter(
                         x=nav_df['Date'], 
                         y=nav_df['Cum_Return_Pct'], 
                         name="累積報酬率 (%)", 
                         mode='lines+markers',
-                        line=dict(color='#A0AAB5', width=2), # 中性灰色引導線
+                        line=dict(color='#A0AAB5', width=2), # 中性質感灰色引導線
                         marker=dict(
                             size=8,
-                            # 💡 大於等於 0 顯示綠色，小於 0 顯示紅色
+                            # 💡 智慧變色：大於等於 0% 顯示綠色，小於 0% 顯示紅色
                             color=np.where(nav_df['Cum_Return_Pct'] >= 0, '#089981', '#f23645'),
                             line=dict(width=1.5, color='white')
                         ),
@@ -842,7 +835,7 @@ if input_df is not None:
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("尚無入金或交易資料可繪製資金曲線。")
-
+                st.session_state['current_capital'] = 0.0
         with tab_daily:
             if not display_df.empty:
                 daily_pnl = display_df.groupby('Exit_Date')['pnl'].sum().reset_index()
