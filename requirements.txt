@@ -1,9 +1,9 @@
 streamlit
-pandas
 numpy
 plotly
 yfinance
-lightweight-charts
+lightweight-charts==1.0.21
+pandas==2.1.4
 streamlit-paste-button
 psycopg2-binary
 SQLAlchemy
