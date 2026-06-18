@@ -554,13 +554,21 @@ else:
         st.sidebar.warning("⚠️ 已退回使用本地預設資料 (Daily_Report.csv)")
 
 if input_df is not None:
-    # 👉 雙模式過濾邏輯：非管理員強制隱藏 2026/04/01 之前的資料
     input_df['Date'] = pd.to_datetime(input_df['Date'])
+    
+    # ✅ 1. 先用「全部完整資料」去算，確保歷史總庫存與總損益完全精準
+    raw_t_df, raw_o_df = calculate_perfect_chartlog_stats(input_df)
+    
+    # ✅ 2. 結算「全時段」的已實現總損益 (給側邊欄資金池用的)
+    global_realized_pnl = raw_t_df['pnl'].sum() if raw_t_df is not None and not raw_t_df.empty else 0.0
+
+    # ✅ 3. 接著才做「雙模式過濾」：把舊的平倉紀錄藏起來，不讓訪客看到明細
     if not st.session_state.get('is_admin', False):
         cutoff_date = pd.to_datetime('2026-04-01')
-        input_df = input_df[input_df['Date'] >= cutoff_date].copy()
+        if raw_t_df is not None and not raw_t_df.empty:
+            raw_t_df['raw_date'] = pd.to_datetime(raw_t_df['raw_date'])
+            raw_t_df = raw_t_df[raw_t_df['raw_date'] >= cutoff_date]
 
-    raw_t_df, raw_o_df = calculate_perfect_chartlog_stats(input_df) 
     strat_map = conn.query("SELECT * FROM trade_strategy_map", ttl=0)
     
     trades_df = pd.DataFrame()
@@ -581,15 +589,14 @@ if input_df is not None:
     # --- 計算資本與儀表板 ---
     try:
         cash_df = conn.query("SELECT amount, date FROM cash_flows", ttl=0)
-        # 資金池也要跟著日期過濾 (若公開模式，不顯示太早的入金)
-        if not cash_df.empty and not st.session_state.get('is_admin', False):
-            cash_df['date'] = pd.to_datetime(cash_df['date'])
-            cash_df = cash_df[cash_df['date'] >= cutoff_date]
+        # ✅ 4. 取消入金日期的過濾！永遠把「所有歷史入金」全部加總
         net_deposits = cash_df['amount'].sum() if not cash_df.empty else 0.0
     except Exception as e:
         net_deposits = 0.0
 
-    realized_pnl = trades_df['pnl'].sum() if 'trades_df' in locals() and not trades_df.empty else 0.0
+    # ✅ 5. 把這行原本用局部 trades_df 算的損益，強制換成一開始算好的「全時段總損益」
+    realized_pnl = global_realized_pnl
+    
     unrealized_pnl = 0.0; projected_unrealized_pnl = 0.0; portfolio_data = []
     
     risk_df = conn.query("SELECT trade_id, initial_sl, trailing_sl FROM notes", ttl=0)
