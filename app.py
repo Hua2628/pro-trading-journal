@@ -29,7 +29,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 雲端連線設定 (Supabase PostgreSQL) ---
+# --- 雲端資料庫與環境初始化 ---
 conn = st.connection("postgresql", type="sql", ttl=0)
 url_supa: str = st.secrets["SUPABASE_URL"]
 key_supa: str = st.secrets["SUPABASE_KEY"]
@@ -61,7 +61,7 @@ def init_db():
              s.execute(text("INSERT INTO strategy_tags (name) VALUES ('情緒性交易') ON CONFLICT DO NOTHING"))
         s.commit()
 
-# --- 極速快取設計：大幅降低重複讀取時間 ---
+# --- 極速快取設計 ---
 @st.cache_data(ttl="1d") 
 def get_stock_data(symbol):
     return yf.download(symbol, period="5y", interval='1d', progress=False)
@@ -69,26 +69,6 @@ def get_stock_data(symbol):
 @st.cache_data(ttl="1d")
 def get_spx_data():
     return yf.download('^GSPC', period="5y", interval='1d', progress=False)
-
-# 👇 解決慢到爆的救星：批次快取即時報價 (5分鐘更新一次，終結迴圈卡頓)
-@st.cache_data(ttl="5m")
-def get_batch_latest_prices(symbols):
-    if not symbols: return {}
-    try:
-        data = yf.download(symbols, period="5d", progress=False)
-        if data.empty: return {}
-        prices = {}
-        if len(symbols) == 1:
-            if 'Close' in data.columns: return {symbols[0]: float(data['Close'].dropna().iloc[-1])}
-        else:
-            if 'Close' in data.columns:
-                closes = data['Close']
-                for sym in symbols:
-                    if sym in closes.columns:
-                        s = closes[sym].dropna()
-                        if not s.empty: prices[sym] = float(s.iloc[-1])
-        return prices
-    except: return {}
 
 @st.cache_data(ttl="1h")
 def fetch_github_csv(pat, fetch_url):
@@ -99,7 +79,7 @@ def fetch_github_csv(pat, fetch_url):
         return None
     except: return None
 
-# --- 雲端自動存檔函數 ---
+# --- 雲端自動存檔轉換邏輯 ---
 def auto_save_risk_params():
     if 'current_trade' in st.session_state:
         tid = st.session_state.current_trade['trade_id']
@@ -107,53 +87,46 @@ def auto_save_risk_params():
         trail_val = st.session_state.get(f"trail_{tid}", 0.0)
         risk_val = st.session_state.get(f"risk_{tid}", 1.0)
         with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET initial_sl=:s, trailing_sl=:t, max_risk_pct=:r WHERE trade_id=:tid"), {"s": sl_val, "t": trail_val, "r": risk_val, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, initial_sl, trailing_sl, max_risk_pct) VALUES (:tid, :s, :t, :r)"), {"tid": tid, "s": sl_val, "t": trail_val, "r": risk_val})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone():
+                s.execute(text("UPDATE notes SET initial_sl=:s, trailing_sl=:t, max_risk_pct=:r WHERE trade_id=:tid"), {"s": sl_val, "t": trail_val, "r": risk_val, "tid": tid})
+            else:
+                s.execute(text("INSERT INTO notes (trade_id, initial_sl, trailing_sl, max_risk_pct) VALUES (:tid, :s, :t, :r)"), {"tid": tid, "s": sl_val, "t": trail_val, "r": risk_val})
             s.commit()
 
 def auto_save_discipline():
     if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        new_val = st.session_state[f"disc_{tid}"]
+        tid, new_val = st.session_state.current_trade['trade_id'], st.session_state[f"disc_{tid}"]
         with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET discipline=:val WHERE trade_id=:tid"), {"val": new_val, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :val)"), {"tid": tid, "val": new_val})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET discipline=:v WHERE trade_id=:tid"), {"v": new_val, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :v)"), {"tid": tid, "v": new_val})
             s.commit()
 
 def auto_save_note():
     if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        new_note = st.session_state[f"note_{tid}"]
+        tid, new_note = st.session_state.current_trade['trade_id'], st.session_state[f"note_{tid}"]
         with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET note=:note WHERE trade_id=:tid"), {"note": new_note, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :note)"), {"tid": tid, "note": new_note})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": new_note, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :n)"), {"tid": tid, "n": new_note})
             s.commit()
 
 def auto_save_market_note():
     if st.session_state.get('view_mode') == 'market' and 'current_market_date' in st.session_state:
-        m_date = st.session_state.current_market_date
-        new_note = st.session_state[f"mkt_note_{m_date}"]
+        m_date, new_note = st.session_state.current_market_date, st.session_state[f"mkt_note_{st.session_state.current_market_date}"]
         with conn.session as s:
             s.execute(text("INSERT INTO market_notes (date, note) VALUES (:d, :n) ON CONFLICT (date) DO UPDATE SET note = EXCLUDED.note"), {"d": m_date, "n": new_note})
             s.commit()
 
 def auto_save_pre_plan():
     if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        new_plan = st.session_state[f"pre_plan_{tid}"]
+        tid, new_plan = st.session_state.current_trade['trade_id'], st.session_state[f"pre_plan_{tid}"]
         with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET pre_plan=:plan WHERE trade_id=:tid"), {"plan": new_plan, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :plan)"), {"tid": tid, "plan": new_plan})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET pre_plan=:p WHERE trade_id=:tid"), {"p": new_plan, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :p)"), {"tid": tid, "p": new_plan})
             s.commit()
 
 def save_trade_strategy():
     if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        strat = st.session_state[f"strat_select_{tid}"]
+        tid, strat = st.session_state.current_trade['trade_id'], st.session_state[f"strat_select_{st.session_state.current_trade['trade_id']}"]
         with conn.session as s:
             s.execute(text("INSERT INTO trade_strategy_map (trade_id, strategy_name) VALUES (:tid, :strat) ON CONFLICT (trade_id) DO UPDATE SET strategy_name = EXCLUDED.strategy_name"), {"tid": tid, "strat": strat})
             s.commit()
@@ -170,7 +143,7 @@ def migrate_open_trade_data(symbol, new_closed_tid):
         s.commit()
 
 # ==========================================
-# 👉 100% 原始繪圖邏輯 (僅加入 drop_duplicates 修復錯位)
+# 👉 100% 原始繪圖與計算邏輯 (從你提供的程式碼完美複製)
 # ==========================================
 def draw_tv_chart(symbol, transactions, initial_sl=0.0):
     try:
@@ -184,16 +157,13 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
             if isinstance(d.columns, pd.MultiIndex): 
                 d.columns = d.columns.get_level_values(0)
         
-        df = df.reset_index()
-        # 👇 避免雲端 yfinance 欄位名稱變異，強制抓第0欄
-        df.rename(columns={df.columns[0]: 'time', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+        df = df.reset_index().rename(columns={
+            'Date': 'time', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'
+        })
+        df['time'] = df['time'].dt.strftime('%Y-%m-%d')
         
-        # 🚀 解決標記漂移的關鍵：加上 utc=True 與 tz_localize(None) 強制清除雲端時區，確保 x 軸是純日期
-        df['time'] = pd.to_datetime(df['time'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-        
-        spx_df = spx_df.reset_index()
-        spx_df.rename(columns={spx_df.columns[0]: 'time', 'Close': 'SPX'}, inplace=True) 
-        spx_df['time'] = pd.to_datetime(spx_df['time'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+        spx_df = spx_df.reset_index().rename(columns={'Date': 'time', 'Close': 'SPX'}) 
+        spx_df['time'] = spx_df['time'].dt.strftime('%Y-%m-%d')
         
         df = pd.merge(df, spx_df[['time', 'SPX']], on='time', how='left').ffill()
         
@@ -317,9 +287,7 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
     except Exception as e:
         import traceback
         return f"圖表發生錯誤: {str(e)}"
-# ==========================================
-# 👉 100% 原始績效計算邏輯
-# ==========================================
+
 @st.cache_data
 def calculate_perfect_chartlog_stats(df):
     df.columns = df.columns.str.strip()
@@ -466,7 +434,7 @@ with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
                 except Exception: pass
             st.rerun()
 
-    available_strats = [row[0] for row in conn.query("SELECT name FROM strategy_tags", ttl="10m").itertuples(index=False)]
+    available_strats = [row[0] for row in conn.query("SELECT name FROM strategy_tags", ttl=0).itertuples(index=False)]
 
     if st.checkbox("管理/刪除標籤"):
         for s_tag in available_strats:
@@ -538,14 +506,14 @@ else:
         st.sidebar.warning("⚠️ 已退回使用本地預設資料 (Daily_Report.csv)")
 
 if input_df is not None:
-    # 👉 雙模式過濾：若非管理員，只計算 2026/04/01 (含) 之後的資料
+    # 👉 雙模式過濾邏輯：非管理員強制隱藏 2026/04/01 之前的資料
     input_df['Date'] = pd.to_datetime(input_df['Date'])
     if not st.session_state.get('is_admin', False):
         cutoff_date = pd.to_datetime('2026-04-01')
         input_df = input_df[input_df['Date'] >= cutoff_date].copy()
 
     raw_t_df, raw_o_df = calculate_perfect_chartlog_stats(input_df) 
-    strat_map = conn.query("SELECT * FROM trade_strategy_map", ttl="10m")
+    strat_map = conn.query("SELECT * FROM trade_strategy_map", ttl=0)
     
     trades_df = pd.DataFrame()
     open_df = pd.DataFrame()
@@ -565,6 +533,7 @@ if input_df is not None:
     # --- 計算資本與儀表板 ---
     try:
         cash_df = conn.query("SELECT amount, date FROM cash_flows", ttl=0)
+        # 資金池也要跟著日期過濾 (若公開模式，不顯示太早的入金)
         if not cash_df.empty and not st.session_state.get('is_admin', False):
             cash_df['date'] = pd.to_datetime(cash_df['date'])
             cash_df = cash_df[cash_df['date'] >= cutoff_date]
@@ -579,13 +548,12 @@ if input_df is not None:
     risk_map = risk_df.set_index('trade_id').to_dict('index') if not risk_df.empty else {}
 
     if open_df is not None and not open_df.empty:
-        open_symbols = open_df['Symbol'].unique().tolist()
-        latest_prices_dict = get_batch_latest_prices(open_symbols)
-
         for _, row in open_df.iterrows():
             try:
-                sym = row['Symbol']
-                latest_price = latest_prices_dict.get(sym, 0)
+                # 這裡使用了你的原始單檔抓取方式（保證不影響畫圖結構）
+                ticker = yf.Ticker(row['Symbol'])
+                hist = ticker.history(period="1d")
+                latest_price = hist['Close'].iloc[-1] if not hist.empty else 0
                 
                 if latest_price > 0:
                     txs = row['transactions']
