@@ -735,11 +735,11 @@ if input_df is not None:
             trade_history['Type'] = 'TradePnL'
 
             conn = sqlite3.connect(DB_NAME)
+# ✅ 修正為專屬雲端 PostgreSQL 的讀取方式
             try:
-                cash_history = pd.read_sql("SELECT date as Date, amount as Amount FROM cash_flows", conn)
+                cash_history = conn.query("SELECT date as Date, amount as Amount FROM cash_flows", ttl=0)
             except Exception:
                 cash_history = pd.DataFrame(columns=['Date', 'Amount'])
-            conn.close()
             cash_history['Type'] = 'CashFlow'
 
             merged_timeline = pd.concat([trade_history, cash_history], ignore_index=True)
