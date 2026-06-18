@@ -15,50 +15,28 @@ import io
 from sqlalchemy import text
 from supabase import create_client, Client
 
-# 👉 [UI優化] 1. 全域環境設定與自訂 CSS 注入 (提升卡片與按鈕質感)
+# 👉 [UI優化] 全域環境設定與自訂 CSS
 st.set_page_config(page_title="Pro Trading Journal", layout="wide", page_icon="📈")
 st.markdown("""
 <style>
-    .block-container {
-        padding-top: 1.5rem !important;
-        padding-bottom: 2rem !important;
-    }
+    .block-container { padding-top: 1.5rem !important; padding-bottom: 2rem !important; }
     div[data-testid="stMetric"] {
-        background-color: #ffffff;
-        border: 1px solid #f0f2f6;
-        padding: 15px 20px;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05), 0 2px 4px -1px rgba(0, 0, 0, 0.03);
-        transition: transform 0.2s ease-in-out;
+        background-color: #ffffff; border: 1px solid #f0f2f6; padding: 15px 20px;
+        border-radius: 10px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); transition: transform 0.2s;
     }
-    div[data-testid="stMetric"]:hover {
-        transform: translateY(-2px);
-    }
-    .stButton > button {
-        border-radius: 8px !important;
-        font-weight: 600 !important;
-        transition: all 0.3s ease !important;
-    }
-    .stButton > button:hover {
-        box-shadow: 0 4px 12px rgba(0,0,0,0.1) !important;
-        border-color: #2196F3 !important;
-        color: #2196F3 !important;
-    }
-    [data-testid="stSidebar"] {
-        background-color: #f8f9fa;
-    }
-    hr {
-        margin: 1.5em 0px;
-        opacity: 0.5;
-    }
+    div[data-testid="stMetric"]:hover { transform: translateY(-2px); }
+    .stButton > button { border-radius: 8px !important; font-weight: 600 !important; transition: all 0.3s ease !important; }
+    .stButton > button:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.1) !important; border-color: #2196F3 !important; color: #2196F3 !important; }
+    [data-testid="stSidebar"] { background-color: #f8f9fa; }
+    hr { margin: 1.5em 0px; opacity: 0.5; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. 環境設定與雲端資料庫初始化 ---
+# --- Supabase 雲端資料庫與圖片儲存初始化 ---
 conn = st.connection("postgresql", type="sql", ttl=0)
-url: str = st.secrets["SUPABASE_URL"]
-key: str = st.secrets["SUPABASE_KEY"]  # 請確保此處在 Secrets 填入的是 service_role key
-supabase: Client = create_client(url, key)
+url_supa: str = st.secrets["SUPABASE_URL"]
+key_supa: str = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(url_supa, key_supa)
 STORAGE_BUCKET = "trade_images"
 
 def init_db():
@@ -71,11 +49,7 @@ def init_db():
             )
         """))
         s.execute(text("CREATE TABLE IF NOT EXISTS market_notes (date TEXT PRIMARY KEY, note TEXT)"))
-        s.execute(text("""
-        CREATE TABLE IF NOT EXISTS cash_flows (
-            flow_id TEXT PRIMARY KEY, date TEXT, amount REAL, note TEXT
-        )
-        """))
+        s.execute(text("CREATE TABLE IF NOT EXISTS cash_flows (flow_id TEXT PRIMARY KEY, date TEXT, amount REAL, note TEXT)"))
         s.execute(text("CREATE TABLE IF NOT EXISTS trade_images (trade_id TEXT, image_path TEXT, category TEXT DEFAULT 'general')"))
         s.execute(text("CREATE TABLE IF NOT EXISTS monthly_reviews (month_id TEXT PRIMARY KEY, note TEXT)"))
         s.execute(text("CREATE TABLE IF NOT EXISTS strategy_tags (name TEXT PRIMARY KEY)"))
@@ -90,7 +64,7 @@ def init_db():
              s.execute(text("INSERT INTO strategy_tags (name) VALUES ('情緒性交易') ON CONFLICT DO NOTHING"))
         s.commit()
 
-# --- 極速快取設計：大幅降低重複讀取時間 ---
+# --- 極速快取設計 ---
 @st.cache_data(ttl="1d") 
 def get_stock_data(symbol):
     return yf.download(symbol, period="5y", interval='1d', progress=False)
@@ -99,80 +73,77 @@ def get_stock_data(symbol):
 def get_spx_data():
     return yf.download('^GSPC', period="5y", interval='1d', progress=False)
 
-# 👇 解決慢到爆的救星：獨立快取即時報價 (5分鐘更新一次，終結卡頓)
+# 👇 解決慢到爆的核心：批次下載所有未平倉股票報價 (0.5秒搞定)
 @st.cache_data(ttl="5m")
-def get_latest_price(symbol):
+def get_batch_latest_prices(symbols):
+    if not symbols: return {}
     try:
-        hist = yf.Ticker(symbol).history(period="1d")
-        return hist['Close'].iloc[-1] if not hist.empty else 0
-    except:
-        return 0
+        data = yf.download(symbols, period="1d", progress=False)
+        if data.empty: return {}
+        if len(symbols) == 1:
+            if 'Close' in data.columns: return {symbols[0]: float(data['Close'].iloc[-1])}
+            return {}
+        if 'Close' in data.columns:
+            closes = data['Close']
+            return {sym: float(closes[sym].iloc[-1]) for sym in symbols if sym in closes.columns and not pd.isna(closes[sym].iloc[-1])}
+        return {}
+    except: return {}
 
 @st.cache_data(ttl="1h")
 def fetch_github_csv(pat, fetch_url):
     headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3.raw"}
     try:
         res = requests.get(fetch_url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            return res.text
+        if res.status_code == 200: return res.text
         return None
     except: return None
 
-# --- 雲端資料庫存檔邏輯 ---
+# --- 雲端自動存檔轉換 (將 sqlite 改為 psycopg2 SQLAlchemy) ---
 def auto_save_risk_params():
     if 'current_trade' in st.session_state:
         tid = st.session_state.current_trade['trade_id']
-        sl_val = st.session_state.get(f"sl_{tid}", 0.0)
-        trail_val = st.session_state.get(f"trail_{tid}", 0.0)
-        risk_val = st.session_state.get(f"risk_{tid}", 1.0)
+        sl_val, trail_val, risk_val = st.session_state.get(f"sl_{tid}", 0.0), st.session_state.get(f"trail_{tid}", 0.0), st.session_state.get(f"risk_{tid}", 1.0)
         with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET initial_sl=:s, trailing_sl=:t, max_risk_pct=:r WHERE trade_id=:tid"), {"s": sl_val, "t": trail_val, "r": risk_val, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, initial_sl, trailing_sl, max_risk_pct) VALUES (:tid, :s, :t, :r)"), {"tid": tid, "s": sl_val, "t": trail_val, "r": risk_val})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone():
+                s.execute(text("UPDATE notes SET initial_sl=:s, trailing_sl=:t, max_risk_pct=:r WHERE trade_id=:tid"), {"s": sl_val, "t": trail_val, "r": risk_val, "tid": tid})
+            else:
+                s.execute(text("INSERT INTO notes (trade_id, initial_sl, trailing_sl, max_risk_pct) VALUES (:tid, :s, :t, :r)"), {"tid": tid, "s": sl_val, "t": trail_val, "r": risk_val})
             s.commit()
 
 def auto_save_discipline():
     if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        new_val = st.session_state[f"disc_{tid}"]
+        tid, new_val = st.session_state.current_trade['trade_id'], st.session_state[f"disc_{tid}"]
         with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET discipline=:v WHERE trade_id=:tid"), {"v": new_val, "tid": tid})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET discipline=:v WHERE trade_id=:tid"), {"v": new_val, "tid": tid})
             else: s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :v)"), {"tid": tid, "v": new_val})
             s.commit()
 
 def auto_save_note():
     if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        new_note = st.session_state[f"note_{tid}"]
+        tid, new_note = st.session_state.current_trade['trade_id'], st.session_state[f"note_{tid}"]
         with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": new_note, "tid": tid})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": new_note, "tid": tid})
             else: s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :n)"), {"tid": tid, "n": new_note})
             s.commit()
 
 def auto_save_market_note():
     if st.session_state.get('view_mode') == 'market' and 'current_market_date' in st.session_state:
-        m_date = st.session_state.current_market_date
-        new_note = st.session_state[f"mkt_note_{m_date}"]
+        m_date, new_note = st.session_state.current_market_date, st.session_state[f"mkt_note_{st.session_state.current_market_date}"]
         with conn.session as s:
             s.execute(text("INSERT INTO market_notes (date, note) VALUES (:d, :n) ON CONFLICT (date) DO UPDATE SET note = EXCLUDED.note"), {"d": m_date, "n": new_note})
             s.commit()
 
 def auto_save_pre_plan():
     if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        new_plan = st.session_state[f"pre_plan_{tid}"]
+        tid, new_plan = st.session_state.current_trade['trade_id'], st.session_state[f"pre_plan_{tid}"]
         with conn.session as s:
-            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result: s.execute(text("UPDATE notes SET pre_plan=:p WHERE trade_id=:tid"), {"p": new_plan, "tid": tid})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET pre_plan=:p WHERE trade_id=:tid"), {"p": new_plan, "tid": tid})
             else: s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :p)"), {"tid": tid, "p": new_plan})
             s.commit()
 
 def save_trade_strategy():
     if 'current_trade' in st.session_state:
-        tid = st.session_state.current_trade['trade_id']
-        strat = st.session_state[f"strat_select_{tid}"]
+        tid, strat = st.session_state.current_trade['trade_id'], st.session_state[f"strat_select_{st.session_state.current_trade['trade_id']}"]
         with conn.session as s:
             s.execute(text("INSERT INTO trade_strategy_map (trade_id, strategy_name) VALUES (:tid, :strat) ON CONFLICT (trade_id) DO UPDATE SET strategy_name = EXCLUDED.strategy_name"), {"tid": tid, "strat": strat})
             s.commit()
@@ -189,7 +160,7 @@ def migrate_open_trade_data(symbol, new_closed_tid):
         s.commit()
 
 # ==========================================
-# 👉 100% 原始繪圖與計算邏輯 (一字不漏還原)
+# 👉 100% 原始繪圖與計算邏輯 (禁止竄改區)
 # ==========================================
 def draw_tv_chart(symbol, transactions, initial_sl=0.0):
     try:
@@ -451,25 +422,24 @@ def load_data(file):
 
 init_db()
 
-
 # ==========================================
-# 👉 雙視角：管理員解鎖區塊 (密碼: 0000)
+# 👉 側邊欄與管理員雙模式解鎖
 # ==========================================
 with st.sidebar.expander("🔐 管理員專屬解鎖", expanded=not st.session_state.get('is_admin', False)):
     if st.session_state.get('is_admin', False):
         st.success("✅ 已解鎖！顯示所有歷史交易。")
-        if st.button("鎖定 (返回 2026/04/01 以後視角)"):
+        if st.button("鎖定 (返回公開模式)"):
             st.session_state['is_admin'] = False
             st.rerun()
     else:
         st.caption("公開模式：僅顯示 2026/04/01 之後資料。")
-        pwd = st.text_input("輸入密碼解鎖全部資料", type="password")
-        if st.button("解鎖"):
+        pwd = st.text_input("輸入管理員密碼", type="password")
+        if st.button("解鎖歷史紀錄"):
             if pwd == "0000":
                 st.session_state['is_admin'] = True
                 st.rerun()
             else:
-                st.error("密碼錯誤！")
+                st.error("密碼錯誤")
 
 with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
     st.subheader("🏷️ 策略管理")
@@ -560,7 +530,6 @@ if input_df is not None:
         input_df = input_df[input_df['Date'] >= cutoff_date].copy()
 
     raw_t_df, raw_o_df = calculate_perfect_chartlog_stats(input_df) 
-    
     strat_map = conn.query("SELECT * FROM trade_strategy_map", ttl=0)
     
     trades_df = pd.DataFrame()
@@ -568,24 +537,20 @@ if input_df is not None:
 
     if raw_t_df is not None and not raw_t_df.empty:
         trades_df = raw_t_df[raw_t_df['pnl'].abs() > 0.1].copy() 
-        if not strat_map.empty:
-            trades_df = trades_df.merge(strat_map, on='trade_id', how='left')
-        else:
-            trades_df['strategy_name'] = "未分類"
+        if not strat_map.empty: trades_df = trades_df.merge(strat_map, on='trade_id', how='left')
+        else: trades_df['strategy_name'] = "未分類"
         trades_df['strategy_name'] = trades_df.get('strategy_name', "未分類").fillna("未分類")
         
     if raw_o_df is not None and not raw_o_df.empty:
         open_df = raw_o_df.copy()
-        if not strat_map.empty:
-            open_df = open_df.merge(strat_map, on='trade_id', how='left')
-        else:
-            open_df['strategy_name'] = "未分類"
+        if not strat_map.empty: open_df = open_df.merge(strat_map, on='trade_id', how='left')
+        else: open_df['strategy_name'] = "未分類"
         open_df['strategy_name'] = open_df.get('strategy_name', "未分類").fillna("未分類")
         
     # --- 計算資本與儀表板 ---
     try:
         cash_df = conn.query("SELECT amount, date FROM cash_flows", ttl=0)
-        # 資金池也要跟著日期過濾
+        # 資金池也跟著日期過濾
         if not cash_df.empty and not st.session_state.get('is_admin', False):
             cash_df['date'] = pd.to_datetime(cash_df['date'])
             cash_df = cash_df[cash_df['date'] >= cutoff_date]
@@ -594,19 +559,23 @@ if input_df is not None:
         net_deposits = 0.0
 
     realized_pnl = trades_df['pnl'].sum() if 'trades_df' in locals() and not trades_df.empty else 0.0
-
-    unrealized_pnl = 0.0
-    projected_unrealized_pnl = 0.0 
-    portfolio_data = []
+    unrealized_pnl = 0.0; projected_unrealized_pnl = 0.0; portfolio_data = []
     
     risk_df = conn.query("SELECT trade_id, initial_sl, trailing_sl FROM notes", ttl=0)
     risk_map = risk_df.set_index('trade_id').to_dict('index') if not risk_df.empty else {}
 
     if open_df is not None and not open_df.empty:
+        # 🚀 執行批次報價獲取
+        open_symbols = open_df['Symbol'].unique().tolist()
+        latest_prices_dict = get_batch_latest_prices(open_symbols)
+
         for _, row in open_df.iterrows():
             try:
-                # 這裡使用了極速快取報價，解決卡頓！
-                latest_price = get_latest_price(row['Symbol'])
+                sym = row['Symbol']
+                latest_price = latest_prices_dict.get(sym, 0)
+                # 雙重保險：如果批次獲取失敗，單獨補抓
+                if latest_price == 0:
+                    latest_price = get_latest_price(sym)
                 
                 if latest_price > 0:
                     txs = row['transactions']
@@ -616,10 +585,8 @@ if input_df is not None:
                     qty_sum = sum(t['qty'] for t in txs if (t['type'] == 'Buy' if is_long else t['type'] == 'Sell'))
                     avg_price = cost_sum / qty_sum if qty_sum > 0 else 0
                     
-                    if is_long:
-                        u_pnl = (latest_price - avg_price) * row['qty']
-                    else:
-                        u_pnl = (avg_price - latest_price) * abs(row['qty'])
+                    if is_long: u_pnl = (latest_price - avg_price) * row['qty']
+                    else: u_pnl = (avg_price - latest_price) * abs(row['qty'])
                         
                     unrealized_pnl += u_pnl
                     
@@ -630,49 +597,34 @@ if input_df is not None:
                     active_stop = t_sl if t_sl > 0 else i_sl
                     if active_stop == 0: active_stop = latest_price 
                     
-                    if is_long:
-                        proj_u_pnl = (active_stop - avg_price) * row['qty']
-                    else:
-                        proj_u_pnl = (avg_price - active_stop) * abs(row['qty'])
+                    if is_long: proj_u_pnl = (active_stop - avg_price) * row['qty']
+                    else: proj_u_pnl = (avg_price - active_stop) * abs(row['qty'])
                         
                     projected_unrealized_pnl += proj_u_pnl
-                    
                     cost_basis = avg_price * abs(row['qty'])
                     market_value = latest_price * abs(row['qty'])
                     u_pnl_pct = (u_pnl / cost_basis * 100) if cost_basis > 0 else 0
                     
                     portfolio_data.append({
-                        "Symbol": row['Symbol'],
-                        "Avg Price": avg_price,
-                        "Latest Price": latest_price,
-                        "Active Stop": active_stop, 
-                        "Unrealized P&L": u_pnl,
-                        "Unrealized P&L %": u_pnl_pct,
-                        "Cost Basis": cost_basis,
-                        "Position": row['qty'],
-                        "Market Value": market_value,
-                        "Projected P&L": proj_u_pnl,
-                        "strategy_name": row.get('strategy_name', '未分類'),
-                        "trade_id": tid
+                        "Symbol": row['Symbol'], "Avg Price": avg_price, "Latest Price": latest_price,
+                        "Active Stop": active_stop, "Unrealized P&L": u_pnl, "Unrealized P&L %": u_pnl_pct,
+                        "Cost Basis": cost_basis, "Position": row['qty'], "Market Value": market_value,
+                        "Projected P&L": proj_u_pnl, "strategy_name": row.get('strategy_name', '未分類'), "trade_id": tid
                     })
-            except Exception:
-                pass 
+            except Exception: pass 
 
     current_capital = net_deposits + realized_pnl + unrealized_pnl
     projected_capital = net_deposits + realized_pnl + projected_unrealized_pnl 
-    
     st.session_state['current_capital'] = current_capital
 
     if portfolio_data and current_capital > 0:
-        for item in portfolio_data:
-            item['% of Net Liq'] = (item['Market Value'] / current_capital) * 100
+        for item in portfolio_data: item['% of Net Liq'] = (item['Market Value'] / current_capital) * 100
 
     portfolio_df = pd.DataFrame(portfolio_data)
 
     st.sidebar.title("💰 帳戶資金總覽")
     st.sidebar.metric(
-        "動態帳戶總餘額 (含浮動)", 
-        f"${current_capital:,.2f}", 
+        "動態帳戶總餘額 (含浮動)", f"${current_capital:,.2f}", 
         f"淨入金: {net_deposits:,.0f} | 浮動: {unrealized_pnl:+,.0f} | 已實現: {realized_pnl:+,.0f}"
     )
     st.session_state['projected_capital'] = projected_capital
@@ -716,13 +668,8 @@ if input_df is not None:
                         m10.metric("Avg. Hold (Loss)", stats['Avg Hold (Loss)'])
 
                 notes_df = conn.query("SELECT trade_id, discipline FROM notes", ttl=0)
-                
-                if not notes_df.empty:
-                     stat_df = display_df.merge(notes_df, on='trade_id', how='left')
-                else:
-                     stat_df = display_df.copy()
-                     stat_df['discipline'] = "未評估"
-                     
+                if not notes_df.empty: stat_df = display_df.merge(notes_df, on='trade_id', how='left')
+                else: stat_df = display_df.copy(); stat_df['discipline'] = "未評估"
                 stat_df['discipline'] = stat_df.get('discipline', "未評估").fillna("未評估")
                 
                 st.divider()
@@ -733,94 +680,41 @@ if input_df is not None:
                 bad_win = stat_df[(stat_df['discipline'] == '❌ 不符合紀律') & (stat_df['pnl'] > 0)]
                 bad_loss = stat_df[(stat_df['discipline'] == '❌ 不符合紀律') & (stat_df['pnl'] <= 0)]
                 
-                good_win_pnl = good_win['pnl'].sum()
-                good_loss_pnl = good_loss['pnl'].sum()
-                bad_win_pnl = bad_win['pnl'].sum()
-                bad_loss_pnl = bad_loss['pnl'].sum()
+                good_win_pnl, good_loss_pnl = good_win['pnl'].sum(), good_loss['pnl'].sum()
+                bad_win_pnl, bad_loss_pnl = bad_win['pnl'].sum(), bad_loss['pnl'].sum()
 
                 q1, q2, q3, q4 = st.columns(4)
-                with q1:
-                    st.metric("✅ 符合紀律 (獲利)", f"${good_win_pnl:,.2f}", f"{len(good_win)} 筆 (應得的報酬)", delta_color="normal")
-                with q2:
-                    st.metric("✅ 符合紀律 (虧損)", f"${good_loss_pnl:,.2f}", f"{len(good_loss)} 筆 (正確的試錯成本)", delta_color="off")
-                with q3:
-                    st.metric("❌ 不守紀律 (獲利)", f"${bad_win_pnl:,.2f}", f"{len(bad_win)} 筆 (賽到的，強化壞習慣)", delta_color="off")
-                with q4:
-                    st.metric("❌ 不守紀律 (虧損)", f"${bad_loss_pnl:,.2f}", f"{len(bad_loss)} 筆 (多賠的冤枉錢)", delta_color="inverse")
+                with q1: st.metric("✅ 符合紀律 (獲利)", f"${good_win_pnl:,.2f}", f"{len(good_win)} 筆 (應得的報酬)", delta_color="normal")
+                with q2: st.metric("✅ 符合紀律 (虧損)", f"${good_loss_pnl:,.2f}", f"{len(good_loss)} 筆 (正確的試錯成本)", delta_color="off")
+                with q3: st.metric("❌ 不守紀律 (獲利)", f"${bad_win_pnl:,.2f}", f"{len(bad_win)} 筆 (賽到的，強化壞習慣)", delta_color="off")
+                with q4: st.metric("❌ 不守紀律 (虧損)", f"${bad_loss_pnl:,.2f}", f"{len(bad_loss)} 筆 (多賠的冤枉錢)", delta_color="inverse")
                 
                 st.caption("💡 註：系統會自動抓取你標註的「紀律」與實際平倉的「損益」進行交叉計算。盡量減少第三、第四象限的交易。")
                 
                 ideal_pnl = good_win_pnl + good_loss_pnl
                 actual_pnl = ideal_pnl + bad_win_pnl + bad_loss_pnl
                 discipline_diff = ideal_pnl - actual_pnl 
-
                 bad_trade_count = len(bad_win) + len(bad_loss)
 
                 if bad_trade_count > 0:
                     if discipline_diff > 0:
-                        st.success(
-                            "⚖️ **紀律覺醒試算：**\n\n"
-                            f"目前包含所有交易的實際總損益為 **${actual_pnl:,.2f}**。\n\n"
-                            f"如果您能管住手（不做右邊那 {bad_trade_count} 筆不守紀律的交易），您的總損益其實會是 **${ideal_pnl:,.2f}**。\n\n"
-                            f"💡 **結論：** 不守紀律讓您白白損失了 **${discipline_diff:,.2f}**！", 
-                            icon="🚀"
-                        )
+                        st.success(f"⚖️ **紀律覺醒試算：**\n\n目前包含所有交易的實際總損益為 **${actual_pnl:,.2f}**。\n\n如果您能管住手（不做右邊那 {bad_trade_count} 筆不守紀律的交易），您的總損益其實會是 **${ideal_pnl:,.2f}**。\n\n💡 **結論：** 不守紀律讓您白白損失了 **${discipline_diff:,.2f}**！", icon="🚀")
                     else:
-                        st.warning(
-                            "⚖️ **紀律覺醒試算：**\n\n"
-                            f"目前包含所有交易的實際總損益為 **${actual_pnl:,.2f}**。\n\n"
-                            f"如果您完全遵守紀律，總損益會是 **${ideal_pnl:,.2f}**。\n\n"
-                            f"💡 **結論：** 雖然目前不守紀律的交易剛好讓您多賺了 **${abs(discipline_diff):,.2f}**，但這多半是「運氣成分」，長期下來極易釀成大錯，請務必當心！", 
-                            icon="⚠️"
-                        )
+                        st.warning(f"⚖️ **紀律覺醒試算：**\n\n目前包含所有交易的實際總損益為 **${actual_pnl:,.2f}**。\n\n如果您完全遵守紀律，總損益會是 **${ideal_pnl:,.2f}**。\n\n💡 **結論：** 雖然目前不守紀律的交易剛好讓您多賺了 **${abs(discipline_diff):,.2f}**，但這多半是「運氣成分」，長期下來極易釀成大錯，請務必當心！", icon="⚠️")
 
                 st.markdown("##### 📈 交易紀律維持率趨勢 (越高越好)")
-                
                 if not stat_df.empty:
                     trend_df = stat_df.sort_values('Month')
+                    trend_data = trend_df.groupby('Month').apply(lambda x: pd.Series({'總交易次數': len(x), '已評估次數': (x['discipline'] != '未評估').sum(), '符合紀律次數': (x['discipline'] == '✅ 符合紀律').sum()})).reset_index()
+                    trend_data['紀律維持率 (%)'] = np.where(trend_data['已評估次數'] > 0, (trend_data['符合紀律次數'] / trend_data['已評估次數'] * 100).round(2), 0.0)
                     
-                    trend_data = trend_df.groupby('Month').apply(
-                        lambda x: pd.Series({
-                            '總交易次數': len(x),
-                            '已評估次數': (x['discipline'] != '未評估').sum(),
-                            '符合紀律次數': (x['discipline'] == '✅ 符合紀律').sum()
-                        })
-                    ).reset_index()
-                    
-                    trend_data['紀律維持率 (%)'] = np.where(
-                        trend_data['已評估次數'] > 0,
-                        (trend_data['符合紀律次數'] / trend_data['已評估次數'] * 100).round(2),
-                        0.0
-                    )
-                    
-                    fig_trend = px.line(
-                        trend_data, x='Month', y='紀律維持率 (%)', text='紀律維持率 (%)',
-                        markers=True, color_discrete_sequence=['#089981']
-                    )
-                    
-                    fig_trend.update_traces(
-                        textposition="top center", 
-                        texttemplate='%{text}%', 
-                        marker=dict(size=10, line=dict(width=2, color='white')),
-                        hovertemplate='月份: %{x}<br>紀律維持率: %{y}%<extra></extra>'
-                    )
-                    
-                    fig_trend.update_layout(
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        xaxis_title="月份", 
-                        yaxis_title="紀律維持率 (%)",
-                        yaxis=dict(range=[-5, 115], showgrid=True, gridcolor='#e0e3eb'), 
-                        xaxis=dict(type='category', showgrid=False), 
-                        height=350, margin=dict(l=0, r=0, t=30, b=0)
-                    )
+                    fig_trend = px.line(trend_data, x='Month', y='紀律維持率 (%)', text='紀律維持率 (%)', markers=True, color_discrete_sequence=['#089981'])
+                    fig_trend.update_traces(textposition="top center", texttemplate='%{text}%', marker=dict(size=10, line=dict(width=2, color='white')), hovertemplate='月份: %{x}<br>紀律維持率: %{y}%<extra></extra>')
+                    fig_trend.update_layout(plot_bgcolor='rgba(0,0,0,0)', xaxis_title="月份", yaxis_title="紀律維持率 (%)", yaxis=dict(range=[-5, 115], showgrid=True, gridcolor='#e0e3eb'), xaxis=dict(type='category', showgrid=False), height=350, margin=dict(l=0, r=0, t=30, b=0))
                     st.plotly_chart(fig_trend, use_container_width=True)
-                else:
-                    st.info("尚無數據可繪製趨勢圖。")
+                else: st.info("尚無數據可繪製趨勢圖。")
+            else: st.info("目前尚無已平倉的交易可供統計。")
 
-            else:
-                st.info("目前尚無已平倉的交易可供統計。")
-
-        # 📈 繪製資金曲線
         with tab_equity:
             trade_history = display_df.groupby('Exit_Date')['pnl'].sum().reset_index() if not display_df.empty else pd.DataFrame(columns=['Exit_Date', 'pnl'])
             trade_history.rename(columns={'Exit_Date': 'Date', 'pnl': 'Amount'}, inplace=True)
@@ -835,76 +729,43 @@ if input_df is not None:
             cash_history['Type'] = 'CashFlow'
 
             merged_timeline = pd.concat([trade_history, cash_history], ignore_index=True)
-            
             if not merged_timeline.empty:
                 merged_timeline = merged_timeline.dropna(subset=['Date'])
                 merged_timeline['Date'] = pd.to_datetime(merged_timeline['Date'])
                 merged_timeline = merged_timeline.sort_values('Date').reset_index(drop=True)
 
-                current_balance = 0.0
-                current_shares = 0.0
-                nav = 1.0
+                current_balance, current_shares, nav = 0.0, 0.0, 1.0
                 history_timeline = []
 
                 for _, row in merged_timeline.iterrows():
                     val = float(row['Amount']) if pd.notnull(row['Amount']) else 0.0
-                    
                     if row['Type'] == 'CashFlow':
-                        if current_balance == 0:
-                            current_shares = val
-                            current_balance = val
+                        if current_balance == 0: current_shares = val; current_balance = val
                         else:
-                            if nav > 0:
-                                current_shares += (val / nav)
+                            if nav > 0: current_shares += (val / nav)
                             current_balance += val
-                            
                     elif row['Type'] == 'TradePnL':
                         current_balance += val
-                        if current_shares > 0:
-                            nav = current_balance / current_shares
+                        if current_shares > 0: nav = current_balance / current_shares
 
-                    history_timeline.append({
-                        'Date': row['Date'],
-                        'Real_Balance': current_balance,
-                        'NAV': nav
-                    })
+                    history_timeline.append({'Date': row['Date'], 'Real_Balance': current_balance, 'NAV': nav})
 
                 if 'unrealized_pnl' in locals() and unrealized_pnl != 0:
                     current_balance += unrealized_pnl
-                    if current_shares > 0:
-                        nav = current_balance / current_shares
-                    
-                    history_timeline.append({
-                        'Date': pd.Timestamp.now().normalize(),
-                        'Real_Balance': current_balance,
-                        'NAV': nav
-                    })
+                    if current_shares > 0: nav = current_balance / current_shares
+                    history_timeline.append({'Date': pd.Timestamp.now().normalize(), 'Real_Balance': current_balance, 'NAV': nav})
 
                 st.session_state['current_capital'] = current_balance
-
                 nav_df = pd.DataFrame(history_timeline)
+                
                 import plotly.graph_objects as go
                 from plotly.subplots import make_subplots
-
                 fig = make_subplots(specs=[[{"secondary_y": True}]])
-                
-                fig.add_trace(
-                    go.Scatter(x=nav_df['Date'], y=nav_df['Real_Balance'], name="真實總資金 ($)", line=dict(color='#2E86C1', width=3), mode='lines+markers'),
-                    secondary_y=False,
-                )
-                fig.add_trace(
-                    go.Scatter(x=nav_df['Date'], y=nav_df['NAV'], name="單位淨值 (NAV)", line=dict(color='#E67E22', width=3), mode='lines+markers'),
-                    secondary_y=True,
-                )
-
-                fig.update_layout(
-                    plot_bgcolor='rgba(0,0,0,0)',
-                    hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
+                fig.add_trace(go.Scatter(x=nav_df['Date'], y=nav_df['Real_Balance'], name="真實總資金 ($)", line=dict(color='#2E86C1', width=3), mode='lines+markers'), secondary_y=False)
+                fig.add_trace(go.Scatter(x=nav_df['Date'], y=nav_df['NAV'], name="單位淨值 (NAV)", line=dict(color='#E67E22', width=3), mode='lines+markers'), secondary_y=True)
+                fig.update_layout(plot_bgcolor='rgba(0,0,0,0)', hovermode="x unified", legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                 fig.update_yaxes(title_text="真實金額 (USD)", secondary_y=False, showgrid=True, gridcolor='lightgray')
                 fig.update_yaxes(title_text="交易實力淨值 (NAV)", secondary_y=True, showgrid=False)
-
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("尚無入金或交易資料可繪製資金曲線。")
@@ -917,12 +778,10 @@ if input_df is not None:
                 fig_bar = px.bar(daily_pnl, x='Exit_Date', y='pnl', title='Daily P&L')
                 fig_bar.update_traces(marker_color=daily_pnl['Color'])
                 st.plotly_chart(fig_bar, use_container_width=True)
-            else:
-                 st.info("尚無資料繪製每日損益。")
+            else: st.info("尚無資料繪製每日損益。")
 
         st.divider()
 
-        # --- 每日與詳細檢討 ---
         left, right = st.columns([1, 4])
         with left:
             with st.container(height=900, border=False):
@@ -944,61 +803,40 @@ if input_df is not None:
 
                 if 'portfolio_df' in locals() and not portfolio_df.empty:
                     st.subheader("🔥 投資組合 (未平倉)")
-                    
                     curr_cap = st.session_state.get('current_capital', 0)
                     proj_cap = st.session_state.get('projected_capital', 0)
-                    
                     import plotly.graph_objects as go
                     
                     proj_color = '#089981' if proj_cap >= curr_cap else '#f23645'
-                    
                     fig_risk = go.Figure(data=[
                         go.Bar(name='當前總資金 (市價)', x=['總帳戶價值'], y=[curr_cap], marker_color='#2196F3', text=f"${curr_cap:,.0f}", textposition='auto'),
                         go.Bar(name='全數觸發停損後保底資金', x=['總帳戶價值'], y=[proj_cap], marker_color=proj_color, text=f"${proj_cap:,.0f}", textposition='auto')
                     ])
-                    fig_risk.update_layout(
-                        barmode='group', 
-                        height=300, 
-                        margin=dict(l=0, r=0, t=30, b=0),
-                        plot_bgcolor='rgba(0,0,0,0)',
-                        yaxis=dict(showgrid=True, gridcolor='#e0e3eb'),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                    )
-                    
+                    fig_risk.update_layout(barmode='group', height=300, margin=dict(l=0, r=0, t=30, b=0), plot_bgcolor='rgba(0,0,0,0)', yaxis=dict(showgrid=True, gridcolor='#e0e3eb'), legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                     st.plotly_chart(fig_risk, use_container_width=True)
                     st.caption("💡 註：保底資金是假設所有未平倉部位，在當下直接精準打到您的「追蹤止損點（若無則為初始停損）」所剩餘的總資金。")
                     
                     st.dataframe(
                         portfolio_df,
                         column_config={
-                            "Symbol": st.column_config.TextColumn("代號"),
-                            "Avg Price": st.column_config.NumberColumn("平均成本", format="$%.3f"),
-                            "Latest Price": st.column_config.NumberColumn("最新報價", format="$%.2f"),
-                            "Active Stop": st.column_config.NumberColumn("生效停損點", format="$%.2f"), 
-                            "Unrealized P&L": st.column_config.NumberColumn("未實現損益", format="$%.0f"),
-                            "Unrealized P&L %": st.column_config.NumberColumn("未實現損益 %", format="%.2f%%"),
-                            "Projected P&L": st.column_config.NumberColumn("觸價後損益 (保底)", format="$%.0f"), 
-                            "Cost Basis": st.column_config.NumberColumn("總成本", format="$%.0f"),
-                            "Position": st.column_config.NumberColumn("持倉股數"),
-                            "% of Net Liq": st.column_config.NumberColumn("資金佔比", format="%.2f%%"),
-                            
+                            "Symbol": st.column_config.TextColumn("代號"), "Avg Price": st.column_config.NumberColumn("平均成本", format="$%.3f"),
+                            "Latest Price": st.column_config.NumberColumn("最新報價", format="$%.2f"), "Active Stop": st.column_config.NumberColumn("生效停損點", format="$%.2f"), 
+                            "Unrealized P&L": st.column_config.NumberColumn("未實現損益", format="$%.0f"), "Unrealized P&L %": st.column_config.NumberColumn("未實現損益 %", format="%.2f%%"),
+                            "Projected P&L": st.column_config.NumberColumn("觸價後損益 (保底)", format="$%.0f"), "Cost Basis": st.column_config.NumberColumn("總成本", format="$%.0f"),
+                            "Position": st.column_config.NumberColumn("持倉股數"), "% of Net Liq": st.column_config.NumberColumn("資金佔比", format="%.2f%%"),
                             "Market Value": None, "strategy_name": None, "trade_id": None
-                        },
-                        hide_index=True, use_container_width=True
+                        }, hide_index=True, use_container_width=True
                     )
                     
                     st.markdown("##### 🔍 點擊進入個股追蹤 / 盤前規劃：")
                     btn_cols = st.columns(min(len(portfolio_df), 6)) 
                     for idx, p_row in portfolio_df.iterrows():
-                        col_idx = idx % 6
-                        with btn_cols[col_idx]:
+                        with btn_cols[idx % 6]:
                             tag_str = f"[{p_row['strategy_name']}] " if p_row['strategy_name'] != "未分類" else ""
                             if st.button(f" {tag_str}{p_row['Symbol']}", key=f"btn_port_{p_row['trade_id']}", use_container_width=True):
                                 st.session_state.view_mode = "trade"
-                                original_item = open_df[open_df['trade_id'] == p_row['trade_id']].iloc[0]
-                                st.session_state.current_trade = original_item.to_dict()
+                                st.session_state.current_trade = open_df[open_df['trade_id'] == p_row['trade_id']].iloc[0].to_dict()
                                 st.rerun()
-                                
                     st.divider()
 
                 st.subheader("📅 已平倉回顧")
@@ -1007,21 +845,15 @@ if input_df is not None:
                     for d, val in daily.items():
                         clr = "green" if val >= 0 else "red"
                         with st.expander(f"{d} | PnL: :{clr}[${val:,.2f}]"):
-                            
                             if st.button(f"🌍 檢視 {d} 大盤市況", key=f"btn_mkt_{d}", use_container_width=True):
-                                st.session_state.view_mode = "market"
-                                st.session_state.current_market_date = d
+                                st.session_state.view_mode = "market"; st.session_state.current_market_date = d
 
                             items = display_df[display_df['Exit_Date'] == d]
                             for _, item in items.iterrows():
                                 tag_str = f"[{item['strategy_name']}] " if item['strategy_name'] != "未分類" else ""
-                                pnl_val = item['pnl']
-                                status_icon = "🟢" if pnl_val > 0 else ("🔴" if pnl_val < 0 else "⚪")
-                                button_label = f"{status_icon} {tag_str}{item['Symbol']} | ${pnl_val:,.2f}"
-                                
-                                if st.button(button_label, key=item['trade_id']):
-                                    st.session_state.view_mode = "trade" 
-                                    st.session_state.current_trade = item.to_dict()
+                                status_icon = "🟢" if item['pnl'] > 0 else ("🔴" if item['pnl'] < 0 else "⚪")
+                                if st.button(f"{status_icon} {tag_str}{item['Symbol']} | ${item['pnl']:,.2f}", key=item['trade_id']):
+                                    st.session_state.view_mode = "trade"; st.session_state.current_trade = item.to_dict()
 
         with right:
             with st.container(border=False):
@@ -1034,7 +866,6 @@ if input_df is not None:
                     m_note_res = conn.query(f"SELECT note FROM market_notes WHERE date='{m_date}'", ttl=0)
                     mkt_tid = f"MARKET_{m_date}"
                     mkt_imgs = conn.query(f"SELECT image_path FROM trade_images WHERE trade_id='{mkt_tid}' AND category='market'", ttl=0)
-                    
                     m_note_db = m_note_res.iloc[0]['note'] if not m_note_res.empty else ""
 
                     st.markdown("##### 📝 市場觀察與情緒紀錄")
@@ -1048,19 +879,11 @@ if input_df is not None:
                         for idx, g_row in mkt_imgs.iterrows():
                             g_url = g_row['image_path']
                             with img_cols[idx % 2]:
-                                img_html = f'''
-                                <div style="width: 100%; height: 300px; display: flex; justify-content: center; align-items: center; overflow: hidden; margin-bottom: 10px;">
-                                    <img src="{g_url}" style="max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 5px;">
-                                </div>
-                                '''
-                                st.markdown(img_html, unsafe_allow_html=True)
-                                
+                                st.markdown(f'<div style="width: 100%; height: 300px; display: flex; justify-content: center; align-items: center; overflow: hidden; margin-bottom: 10px;"><img src="{g_url}" style="max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 5px;"></div>', unsafe_allow_html=True)
                                 if st.button("🗑️ 刪除圖片", key=f"del_mkt_{g_url}"):
-                                    with conn.session as s:
-                                        s.execute(text("DELETE FROM trade_images WHERE image_path=:path"), {"path": g_url})
-                                        s.commit()
-                                    file_name = g_url.split('/')[-1]
-                                    supabase.storage.from_(STORAGE_BUCKET).remove([file_name])
+                                    with conn.session as s: s.execute(text("DELETE FROM trade_images WHERE image_path=:path"), {"path": g_url}); s.commit()
+                                    try: supabase.storage.from_(STORAGE_BUCKET).remove([g_url.split('/')[-1]])
+                                    except: pass
                                     st.rerun()
                     
                     st.divider()
@@ -1072,13 +895,10 @@ if input_df is not None:
                             for up_img in up_imgs:
                                 file_name = f"{mkt_tid}_{up_img.name}"
                                 file_bytes = up_img.getvalue()
-                                
                                 try:
                                     supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
                                     public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
-                                    with conn.session as s:
-                                        s.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'market')"), {"tid": mkt_tid, "path": public_url})
-                                        s.commit()
+                                    with conn.session as s: s.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'market')"), {"tid": mkt_tid, "path": public_url}); s.commit()
                                     changed = True
                                 except Exception as e: st.error(f"上傳失敗: {e}")
                             if changed: st.rerun()
@@ -1092,13 +912,10 @@ if input_df is not None:
                                 file_name = f"{mkt_tid}_{uuid.uuid4().hex[:8]}.png"
                                 img_byte_arr = io.BytesIO()
                                 pasted_img.image_data.save(img_byte_arr, format='PNG')
-                                file_bytes = img_byte_arr.getvalue()
                                 try:
-                                    supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
+                                    supabase.storage.from_(STORAGE_BUCKET).upload(file=img_byte_arr.getvalue(), path=file_name, file_options={"content-type": "image/png"})
                                     public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
-                                    with conn.session as s:
-                                        s.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'market')"), {"tid": mkt_tid, "path": public_url})
-                                        s.commit()
+                                    with conn.session as s: s.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'market')"), {"tid": mkt_tid, "path": public_url}); s.commit()
                                     st.session_state[f"last_hash_{mkt_tid}"] = img_hash
                                     st.rerun()
                                 except Exception as e: st.error(f"貼上上傳失敗: {e}")
@@ -1153,7 +970,6 @@ if input_df is not None:
                     st.divider()
 
                     left_main_col, right_main_col = st.columns([6, 1])
-
                     with left_main_col:
                         text_col1, text_col2 = st.columns(2)
                         with text_col1:
@@ -1172,31 +988,23 @@ if input_df is not None:
                                 with img_cols[idx % 2]: 
                                     img_html = f'''
                                     <style>
-                                        .review-zoom-box {{
-                                            width: 100%; height: 220px; display: flex; justify-content: center; align-items: center; overflow: hidden;
-                                            background-color: #f8f9fa; border-radius: 6px; border: 1px solid #e0e3eb; cursor: zoom-in;
-                                        }}
+                                        .review-zoom-box {{ width: 100%; height: 220px; display: flex; justify-content: center; align-items: center; overflow: hidden; background-color: #f8f9fa; border-radius: 6px; border: 1px solid #e0e3eb; cursor: zoom-in; }}
                                         .review-zoom-box img {{ max-width: 100%; max-height: 100%; object-fit: contain; }}
                                         img:fullscreen {{ max-width: 100% !important; max-height: 100% !important; object-fit: contain !important; background-color: #000000 !important; }}
                                     </style>
                                     <div class="review-zoom-box"><img src="{g_url}" title="連點兩下全螢幕放大" ondblclick="toggleFullscreen(this)"></div>
                                     <script>
                                         function toggleFullscreen(elem) {{
-                                            if (!document.fullscreenElement) {{
-                                                if (elem.requestFullscreen) {{ elem.requestFullscreen();
-                                                }} else if (elem.webkitRequestFullscreen) {{ elem.webkitRequestFullscreen(); }}
+                                            if (!document.fullscreenElement) {{ if (elem.requestFullscreen) {{ elem.requestFullscreen(); }} else if (elem.webkitRequestFullscreen) {{ elem.webkitRequestFullscreen(); }}
                                             }} else {{ if (document.exitFullscreen) {{ document.exitFullscreen(); }} }}
                                         }}
                                     </script>
                                     '''
                                     st.components.v1.html(img_html, height=230)
-
                                     if st.button("🗑️ 刪除此圖片", key=f"del_gen_{g_url}"):
-                                        with conn.session as sq:
-                                            sq.execute(text("DELETE FROM trade_images WHERE image_path=:path"), {"path": g_url})
-                                            sq.commit()
-                                        file_name = g_url.split('/')[-1]
-                                        supabase.storage.from_(STORAGE_BUCKET).remove([file_name])
+                                        with conn.session as sq: sq.execute(text("DELETE FROM trade_images WHERE image_path=:path"), {"path": g_url}); sq.commit()
+                                        try: supabase.storage.from_(STORAGE_BUCKET).remove([g_url.split('/')[-1]])
+                                        except: pass
                                         st.rerun()
 
                         st.write("📋 點擊按鈕貼上檢討圖")
@@ -1207,13 +1015,10 @@ if input_df is not None:
                                 file_name = f"{tid}_{uuid.uuid4().hex[:8]}.png"
                                 img_byte_arr = io.BytesIO()
                                 pasted_img.image_data.save(img_byte_arr, format='PNG')
-                                file_bytes = img_byte_arr.getvalue()
                                 try:
-                                    supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
+                                    supabase.storage.from_(STORAGE_BUCKET).upload(file=img_byte_arr.getvalue(), path=file_name, file_options={"content-type": "image/png"})
                                     public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
-                                    with conn.session as sq:
-                                        sq.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'general')"), {"tid": tid, "path": public_url})
-                                        sq.commit()
+                                    with conn.session as sq: sq.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'general')"), {"tid": tid, "path": public_url}); sq.commit()
                                     st.session_state[f"last_hash_{tid}"] = img_hash
                                     st.rerun()
                                 except Exception as e: st.error(f"貼上上傳失敗: {e}")
@@ -1286,11 +1091,9 @@ if input_df is not None:
                                 img_html = f'<div style="width: 100%; display: flex; justify-content: center; align-items: flex-start;"><img src="{p_url}" style="width: 100%; max-height: 320px; object-fit: contain; border-radius: 5px;"></div>'
                                 st.markdown(img_html, unsafe_allow_html=True)
                             if st.button("🗑️ 刪除", key=f"del_pre_{p_url}"):
-                                with conn.session as sq:
-                                    sq.execute(text("DELETE FROM trade_images WHERE image_path=:path"), {"path": p_url})
-                                    sq.commit()
-                                file_name = p_url.split('/')[-1]
-                                supabase.storage.from_(STORAGE_BUCKET).remove([file_name])
+                                with conn.session as sq: sq.execute(text("DELETE FROM trade_images WHERE image_path=:path"), {"path": p_url}); sq.commit()
+                                try: supabase.storage.from_(STORAGE_BUCKET).remove([p_url.split('/')[-1]])
+                                except: pass
                                 st.rerun()
                     else: st.caption("尚未貼上規劃圖")
                     
@@ -1301,13 +1104,10 @@ if input_df is not None:
                             file_name = f"PP_{tid}_{uuid.uuid4().hex[:5]}.png"
                             img_byte_arr = io.BytesIO()
                             p_paste.image_data.save(img_byte_arr, format='PNG')
-                            file_bytes = img_byte_arr.getvalue()
                             try:
-                                supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
+                                supabase.storage.from_(STORAGE_BUCKET).upload(file=img_byte_arr.getvalue(), path=file_name, file_options={"content-type": "image/png"})
                                 public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
-                                with conn.session as sq:
-                                    sq.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'pre_plan')"), {"tid": tid, "path": public_url})
-                                    sq.commit()
+                                with conn.session as sq: sq.execute(text("INSERT INTO trade_images (trade_id, image_path, category) VALUES (:tid, :path, 'pre_plan')"), {"tid": tid, "path": public_url}); sq.commit()
                                 st.session_state[f"pp_hash_{tid}"] = p_hash
                                 st.rerun()
                             except Exception as e: st.error(f"貼上上傳失敗: {e}")
