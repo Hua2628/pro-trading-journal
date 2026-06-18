@@ -143,16 +143,14 @@ def migrate_open_trade_data(symbol, new_closed_tid):
         s.commit()
 
 # ==========================================
-# 👉 100% 原始繪圖與計算邏輯 (從你提供的程式碼完美複製)
+# 👉 全新升級：修正 TV 圖表比例失真與假日缺失問題
 # ==========================================
 def draw_tv_chart(symbol, transactions, initial_sl=0.0):
     try:
-        # 1. 抓取資料
         df = get_stock_data(symbol).copy()
         spx_df = get_spx_data().copy()
         if df.empty: return None
 
-        # 資料清洗與欄位重命名
         for d in [df, spx_df]:
             if isinstance(d.columns, pd.MultiIndex): 
                 d.columns = d.columns.get_level_values(0)
@@ -227,53 +225,49 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
             buy_records = []
             sell_records = []
             fallback_records = []
+            
+            valid_times = set(df['time'].values)
+            sorted_times = sorted(list(valid_times))
 
             for trx in transactions:
                 trx_date_str = pd.to_datetime(trx['date']).strftime('%Y-%m-%d')
-                if trx_date_str not in df['time'].values:
-                    continue
+                
+                # 解決假日下單找不到日期的問題 (自動貼齊最近的交易日)
+                if trx_date_str not in valid_times:
+                    prior_dates = [d for d in sorted_times if d <= trx_date_str]
+                    if prior_dates: trx_date_str = prior_dates[-1]
+                    else: continue
                     
                 price = trx.get('price', 0)
                 if price > 0:
-                    if trx['type'] == 'Buy':
-                        buy_records.append({'time': trx_date_str, 'BuyPrice': price})
-                    else:
-                        sell_records.append({'time': trx_date_str, 'SellPrice': price})
+                    if trx['type'] == 'Buy': buy_records.append({'time': trx_date_str, 'BuyPrice': price})
+                    else: sell_records.append({'time': trx_date_str, 'SellPrice': price})
                 else:
                     fallback_records.append(trx)
 
+            # 解決 Y 軸比例失真：改用 how='inner' 取代 ffill/bfill，避免買賣點強行貫穿 5 年歷史
             if buy_records:
                 buy_series = chart.create_line(name='BuyPrice', color='rgba(0,0,0,0)', price_line=False, price_label=False)
                 buy_grouped = pd.DataFrame(buy_records).groupby('time').mean().reset_index()
-                
-                buy_df = df[['time']].merge(buy_grouped, on='time', how='left').ffill().bfill()
+                buy_df = df[['time']].merge(buy_grouped, on='time', how='inner')
                 buy_series.set(buy_df)
-                
                 for _, row in buy_grouped.iterrows():
-                    buy_series.marker(
-                        time=row['time'], 
-                        position='inside', 
-                        shape='arrow_up', 
-                        color="#000000" 
-                    )
+                    buy_series.marker(time=row['time'], position='inside', shape='arrow_up', color="#000000")
 
             if sell_records:
                 sell_series = chart.create_line(name='SellPrice', color='rgba(0,0,0,0)', price_line=False, price_label=False)
                 sell_grouped = pd.DataFrame(sell_records).groupby('time').mean().reset_index()
-                
-                sell_df = df[['time']].merge(sell_grouped, on='time', how='left').ffill().bfill()
+                sell_df = df[['time']].merge(sell_grouped, on='time', how='inner')
                 sell_series.set(sell_df)
-                
                 for _, row in sell_grouped.iterrows():
-                    sell_series.marker(
-                        time=row['time'], 
-                        position='inside', 
-                        shape='arrow_down', 
-                        color='#000000' 
-                    )
+                    sell_series.marker(time=row['time'], position='inside', shape='arrow_down', color='#000000')
 
             for trx in fallback_records:
                 d_str = pd.to_datetime(trx['date']).strftime('%Y-%m-%d')
+                if d_str not in valid_times:
+                    prior_dates = [d for d in sorted_times if d <= d_str]
+                    if prior_dates: d_str = prior_dates[-1]
+                    else: continue
                 if trx['type'] == 'Buy':
                     chart.marker(time=d_str, position='belowBar', shape='arrow_up', color="#000000")
                 else:
@@ -285,13 +279,14 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
 
         return chart
     except Exception as e:
-        import traceback
         return f"圖表發生錯誤: {str(e)}"
 
+# ==========================================
+# 👉 全新升級：採用平均成本 (Average Cost FIFO) 精準解離未平倉部位，確保 All-Time 統計完全正確
+# ==========================================
 @st.cache_data
 def calculate_perfect_chartlog_stats(df):
     df.columns = df.columns.str.strip()
-    
     try:
         type_col = next(col for col in df.columns if df[col].astype(str).str.contains('Buy|Sell', case=False, na=False).any())
     except StopIteration: 
@@ -299,7 +294,7 @@ def calculate_perfect_chartlog_stats(df):
 
     price_col = None
     for col in df.columns:
-        if col.strip().lower() in ['price', 'trade price', 'avg price', '價格', '成交價','Price']:
+        if col.strip().lower() in ['price', 'trade price', 'avg price', '價格', '成交價','price']:
             price_col = col
             break
     
@@ -317,50 +312,70 @@ def calculate_perfect_chartlog_stats(df):
     
     for _, row in df.iterrows():
         symbol = str(row['Symbol']).strip()
-        if symbol.lower() == 'nan' or symbol == '' or symbol == '-':
-            continue
+        if symbol.lower() == 'nan' or symbol == '' or symbol == '-': continue
             
         t_type = str(row[type_col]).strip().capitalize()
         qty = row['Quantity']
         amt = row['Net Cash']
         date = row['Date']
 
-        trade_price = 0
-        if price_col and pd.notnull(row[price_col]):
-            try:
-                trade_price = float(str(row[price_col]).replace(',', '').strip())
-            except ValueError:
-                trade_price = 0
+        is_buy = 'Buy' in t_type
+        is_sell = 'Sell' in t_type
+        if not is_buy and not is_sell: continue
+        if qty == 0: continue
+
+        cost_per_share = abs(amt) / qty if qty > 0 else 0
+        trade_price = float(str(row[price_col]).replace(',', '').strip()) if price_col and pd.notnull(row[price_col]) else cost_per_share
         
-        if qty == 0: 
-            continue
-            
-        if symbol not in tracker: tracker[symbol] = {'qty': 0, 'cash_flow': 0, 'start_date': date, 'transactions': []}
+        if symbol not in tracker: 
+            tracker[symbol] = {'qty': 0, 'cost_basis': 0, 'start_date': date, 'transactions': []}
         t = tracker[symbol]
-        
-        if 'Buy' in t_type: 
-            t['qty'] += qty
-            t['cash_flow'] -= amt 
-            t['transactions'].append({'date': date, 'type': 'Buy', 'qty': qty, 'price': trade_price})
-        elif 'Sell' in t_type: 
-            t['qty'] -= qty
-            t['cash_flow'] += amt
-            t['transactions'].append({'date': date, 'type': 'Sell', 'qty': qty, 'price': trade_price})
+
+        t['transactions'].append({'date': date, 'type': t_type, 'qty': qty, 'price': trade_price})
+
+        if t['qty'] == 0:
+            t['qty'] = qty if is_buy else -qty
+            t['cost_basis'] = abs(amt)
+            t['start_date'] = date
+        elif (t['qty'] > 0 and is_buy) or (t['qty'] < 0 and is_sell):
+            t['qty'] += qty if is_buy else -qty
+            t['cost_basis'] += abs(amt)
         else:
-            continue
+            # 進行減倉操作，立即釋放該部分的已實現損益
+            close_qty = min(qty, abs(t['qty']))
+            avg_cost_per_share = t['cost_basis'] / abs(t['qty'])
+            cost_of_closed = avg_cost_per_share * close_qty
             
-        if abs(t['qty']) < 1e-5:
-            tid = f"{date.strftime('%Y%m%d')}_{symbol}_{round(t['cash_flow'], 2)}"
+            if t['qty'] > 0: # 多單平倉
+                realized = abs(amt) * (close_qty / qty) - cost_of_closed
+            else: # 空單回補
+                realized = cost_of_closed - abs(amt) * (close_qty / qty)
+            
+            t['qty'] -= close_qty if t['qty'] > 0 else -close_qty
+            t['cost_basis'] -= cost_of_closed
+
+            tid = f"{date.strftime('%Y%m%d')}_{symbol}_{round(realized, 2)}"
             closed_trades.append({
-                'trade_id': tid, 'Exit_Date': date.strftime('%Y-%m-%d'), 
-                'Symbol': symbol, 'pnl': t['cash_flow'], 
-                'hold_time': date - t['start_date'], 'raw_date': date,
+                'trade_id': tid, 
+                'Exit_Date': date.strftime('%Y-%m-%d'), 
+                'Symbol': symbol, 
+                'pnl': realized, 
+                'hold_time': date - t['start_date'], 
+                'raw_date': date,
                 'entry_date': t['start_date'],
-                'transactions': t['transactions'] 
+                'transactions': t['transactions'].copy()
             })
             migrate_open_trade_data(symbol, tid)
-            del tracker[symbol]
-            
+
+            remain_qty = qty - close_qty
+            if remain_qty > 1e-5:
+                t['qty'] = remain_qty if is_buy else -remain_qty
+                t['cost_basis'] = abs(amt) * (remain_qty / qty)
+                t['start_date'] = date
+                
+            if abs(t['qty']) < 1e-5:
+                del tracker[symbol]
+                
     open_trades = []
     for symbol, t in tracker.items():
         if abs(t['qty']) >= 1e-5:
@@ -550,7 +565,6 @@ if input_df is not None:
     if open_df is not None and not open_df.empty:
         for _, row in open_df.iterrows():
             try:
-                # 這裡使用了你的原始單檔抓取方式（保證不影響畫圖結構）
                 ticker = yf.Ticker(row['Symbol'])
                 hist = ticker.history(period="1d")
                 latest_price = hist['Close'].iloc[-1] if not hist.empty else 0
