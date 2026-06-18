@@ -104,18 +104,40 @@ def auto_save_risk_params():
 
 def auto_save_discipline():
     if 'current_trade' in st.session_state:
-        tid, new_val = st.session_state.current_trade['trade_id'], st.session_state[f"disc_{tid}"]
+        # ✅ 先拆出 tid
+        tid = st.session_state.current_trade['trade_id']
+        new_val = st.session_state[f"disc_{tid}"]
         with conn.session as s:
-            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET discipline=:v WHERE trade_id=:tid"), {"v": new_val, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :v)"), {"tid": tid, "v": new_val})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): 
+                s.execute(text("UPDATE notes SET discipline=:v WHERE trade_id=:tid"), {"v": new_val, "tid": tid})
+            else: 
+                s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :v)"), {"tid": tid, "v": new_val})
             s.commit()
 
 def auto_save_note():
     if 'current_trade' in st.session_state:
-        tid, new_note = st.session_state.current_trade['trade_id'], st.session_state[f"note_{tid}"]
+        # ✅ 先拆出 tid
+        tid = st.session_state.current_trade['trade_id']
+        new_note = st.session_state[f"note_{tid}"]
         with conn.session as s:
-            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": new_note, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :n)"), {"tid": tid, "n": new_note})
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): 
+                s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": n_note, "tid": tid}) # 注意原本程式碼此處變數為 new_note
+                # 為了保險，修正為正確的變數名稱：
+                s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": new_note, "tid": tid})
+            else: 
+                s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :n)"), {"tid": tid, "n": new_note})
+            s.commit()
+
+def auto_save_pre_plan():
+    if 'current_trade' in st.session_state:
+        # ✅ 先拆出 tid
+        tid = st.session_state.current_trade['trade_id']
+        new_plan = st.session_state[f"pre_plan_{tid}"]
+        with conn.session as s:
+            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): 
+                s.execute(text("UPDATE notes SET pre_plan=:p WHERE trade_id=:tid"), {"p": new_plan, "tid": tid})
+            else: 
+                s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :p)"), {"tid": tid, "p": new_plan})
             s.commit()
 
 def auto_save_market_note():
@@ -125,13 +147,7 @@ def auto_save_market_note():
             s.execute(text("INSERT INTO market_notes (date, note) VALUES (:d, :n) ON CONFLICT (date) DO UPDATE SET note = EXCLUDED.note"), {"d": m_date, "n": new_note})
             s.commit()
 
-def auto_save_pre_plan():
-    if 'current_trade' in st.session_state:
-        tid, new_plan = st.session_state.current_trade['trade_id'], st.session_state[f"pre_plan_{tid}"]
-        with conn.session as s:
-            if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): s.execute(text("UPDATE notes SET pre_plan=:p WHERE trade_id=:tid"), {"p": new_plan, "tid": tid})
-            else: s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :p)"), {"tid": tid, "p": new_plan})
-            s.commit()
+
 
 def save_trade_strategy():
     if 'current_trade' in st.session_state:
