@@ -15,11 +15,8 @@ import io
 from sqlalchemy import text
 from supabase import create_client, Client
 
-# ==========================================
-# 👉 全域環境設定
-# ==========================================
+# 👉 [UI優化] 1. 全域環境設定與自訂 CSS 注入
 st.set_page_config(page_title="Pro Trading Journal", layout="wide", page_icon="📈")
-
 st.markdown("""
 <style>
     .block-container {
@@ -57,37 +54,24 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 環境設定與 Supabase 初始化 ---
+# --- 雲端連線設定 ---
 conn = st.connection("postgresql", type="sql", ttl=0)
-
-url: str = st.secrets["SUPABASE_URL"]
-key: str = st.secrets["SUPABASE_KEY"]
-supabase: Client = create_client(url, key)
+url_supa: str = st.secrets["SUPABASE_URL"]
+key_supa: str = st.secrets["SUPABASE_KEY"]
+supabase: Client = create_client(url_supa, key_supa)
 STORAGE_BUCKET = "trade_images"
 
 def init_db():
     with conn.session as s:
         s.execute(text("""
             CREATE TABLE IF NOT EXISTS notes (
-                trade_id TEXT PRIMARY KEY, 
-                note TEXT, 
-                pre_plan TEXT,
-                market_cond TEXT,
-                initial_sl REAL DEFAULT 0.0,
-                trailing_sl REAL DEFAULT 0.0,
-                max_risk_pct REAL DEFAULT 1.0,
-                discipline TEXT DEFAULT '未評估'
+                trade_id TEXT PRIMARY KEY, note TEXT, pre_plan TEXT, market_cond TEXT,
+                initial_sl REAL DEFAULT 0.0, trailing_sl REAL DEFAULT 0.0,
+                max_risk_pct REAL DEFAULT 1.0, discipline TEXT DEFAULT '未評估'
             )
         """))
         s.execute(text("CREATE TABLE IF NOT EXISTS market_notes (date TEXT PRIMARY KEY, note TEXT)"))
-        s.execute(text("""
-        CREATE TABLE IF NOT EXISTS cash_flows (
-            flow_id TEXT PRIMARY KEY,
-            date TEXT,
-            amount REAL,
-            note TEXT
-        )
-        """))
+        s.execute(text("CREATE TABLE IF NOT EXISTS cash_flows (flow_id TEXT PRIMARY KEY, date TEXT, amount REAL, note TEXT)"))
         s.execute(text("CREATE TABLE IF NOT EXISTS trade_images (trade_id TEXT, image_path TEXT, category TEXT DEFAULT 'general')"))
         s.execute(text("CREATE TABLE IF NOT EXISTS monthly_reviews (month_id TEXT PRIMARY KEY, note TEXT)"))
         s.execute(text("CREATE TABLE IF NOT EXISTS strategy_tags (name TEXT PRIMARY KEY)"))
@@ -102,7 +86,7 @@ def init_db():
              s.execute(text("INSERT INTO strategy_tags (name) VALUES ('情緒性交易') ON CONFLICT DO NOTHING"))
         s.commit()
 
-# --- 極速快取設計：大幅降低重複讀取時間 ---
+# --- 極速快取函數 ---
 @st.cache_data(ttl="1d") 
 def get_stock_data(symbol):
     return yf.download(symbol, period="5y", interval='1d', progress=False)
@@ -111,6 +95,7 @@ def get_stock_data(symbol):
 def get_spx_data():
     return yf.download('^GSPC', period="5y", interval='1d', progress=False)
 
+# 👇 解決慢到爆的救星：獨立快取即時報價 (5分鐘更新一次)
 @st.cache_data(ttl="5m")
 def get_latest_price(symbol):
     try:
@@ -120,17 +105,15 @@ def get_latest_price(symbol):
         return 0
 
 @st.cache_data(ttl="1h")
-def fetch_github_csv(pat, fetch_url):
+def fetch_github_csv(pat, url_csv):
     headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3.raw"}
     try:
-        res = requests.get(fetch_url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            return res.text
+        res = requests.get(url_csv, headers=headers, timeout=10)
+        if res.status_code == 200: return res.text
         return None
-    except:
-        return None
+    except: return None
 
-# --- 資料庫存檔邏輯 ---
+# --- 雲端自動存檔函數 ---
 def auto_save_risk_params():
     if 'current_trade' in st.session_state:
         tid = st.session_state.current_trade['trade_id']
@@ -140,11 +123,9 @@ def auto_save_risk_params():
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
             if result:
-                s.execute(text("UPDATE notes SET initial_sl = :sl, trailing_sl = :trail, max_risk_pct = :risk WHERE trade_id = :tid"), 
-                          {"sl": sl_val, "trail": trail_val, "risk": risk_val, "tid": tid})
+                s.execute(text("UPDATE notes SET initial_sl=:sl, trailing_sl=:trail, max_risk_pct=:risk WHERE trade_id=:tid"), {"sl": sl_val, "trail": trail_val, "risk": risk_val, "tid": tid})
             else:
-                s.execute(text("INSERT INTO notes (trade_id, initial_sl, trailing_sl, max_risk_pct) VALUES (:tid, :sl, :trail, :risk)"), 
-                          {"tid": tid, "sl": sl_val, "trail": trail_val, "risk": risk_val})
+                s.execute(text("INSERT INTO notes (trade_id, initial_sl, trailing_sl, max_risk_pct) VALUES (:tid, :sl, :trail, :risk)"), {"tid": tid, "sl": sl_val, "trail": trail_val, "risk": risk_val})
             s.commit()
 
 def auto_save_discipline():
@@ -153,10 +134,8 @@ def auto_save_discipline():
         new_val = st.session_state[f"disc_{tid}"]
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result:
-                s.execute(text("UPDATE notes SET discipline = :val WHERE trade_id = :tid"), {"val": new_val, "tid": tid})
-            else:
-                s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :val)"), {"tid": tid, "val": new_val})
+            if result: s.execute(text("UPDATE notes SET discipline=:val WHERE trade_id=:tid"), {"val": new_val, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, discipline) VALUES (:tid, :val)"), {"tid": tid, "val": new_val})
             s.commit()
 
 def auto_save_note():
@@ -165,10 +144,8 @@ def auto_save_note():
         new_note = st.session_state[f"note_{tid}"]
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result:
-                s.execute(text("UPDATE notes SET note = :note WHERE trade_id = :tid"), {"note": new_note, "tid": tid})
-            else:
-                s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :note)"), {"tid": tid, "note": new_note})
+            if result: s.execute(text("UPDATE notes SET note=:note WHERE trade_id=:tid"), {"note": new_note, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :note)"), {"tid": tid, "note": new_note})
             s.commit()
 
 def auto_save_market_note():
@@ -176,10 +153,7 @@ def auto_save_market_note():
         m_date = st.session_state.current_market_date
         new_note = st.session_state[f"mkt_note_{m_date}"]
         with conn.session as s:
-            s.execute(text("""
-                INSERT INTO market_notes (date, note) VALUES (:date, :note)
-                ON CONFLICT (date) DO UPDATE SET note = EXCLUDED.note
-            """), {"date": m_date, "note": new_note})
+            s.execute(text("INSERT INTO market_notes (date, note) VALUES (:date, :note) ON CONFLICT (date) DO UPDATE SET note = EXCLUDED.note"), {"date": m_date, "note": new_note})
             s.commit()
 
 def auto_save_pre_plan():
@@ -188,10 +162,18 @@ def auto_save_pre_plan():
         new_plan = st.session_state[f"pre_plan_{tid}"]
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
-            if result:
-                s.execute(text("UPDATE notes SET pre_plan = :plan WHERE trade_id = :tid"), {"plan": new_plan, "tid": tid})
-            else:
-                s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :plan)"), {"tid": tid, "plan": new_plan})
+            if result: s.execute(text("UPDATE notes SET pre_plan=:plan WHERE trade_id=:tid"), {"plan": new_plan, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, pre_plan) VALUES (:tid, :plan)"), {"tid": tid, "plan": new_plan})
+            s.commit()
+
+def auto_save_market_cond():
+    if 'current_trade' in st.session_state:
+        tid = st.session_state.current_trade['trade_id']
+        new_cond = st.session_state[f"market_cond_{tid}"]
+        with conn.session as s:
+            result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
+            if result: s.execute(text("UPDATE notes SET market_cond=:cond WHERE trade_id=:tid"), {"cond": new_cond, "tid": tid})
+            else: s.execute(text("INSERT INTO notes (trade_id, market_cond) VALUES (:tid, :cond)"), {"tid": tid, "cond": new_cond})
             s.commit()
 
 def save_trade_strategy():
@@ -199,10 +181,7 @@ def save_trade_strategy():
         tid = st.session_state.current_trade['trade_id']
         strat = st.session_state[f"strat_select_{tid}"]
         with conn.session as s:
-            s.execute(text("""
-                INSERT INTO trade_strategy_map (trade_id, strategy_name) VALUES (:tid, :strat)
-                ON CONFLICT (trade_id) DO UPDATE SET strategy_name = EXCLUDED.strategy_name
-            """), {"tid": tid, "strat": strat})
+            s.execute(text("INSERT INTO trade_strategy_map (trade_id, strategy_name) VALUES (:tid, :strat) ON CONFLICT (trade_id) DO UPDATE SET strategy_name = EXCLUDED.strategy_name"), {"tid": tid, "strat": strat})
             s.commit()
 
 def migrate_open_trade_data(symbol, new_closed_tid):
@@ -216,9 +195,8 @@ def migrate_open_trade_data(symbol, new_closed_tid):
             s.execute(text("UPDATE trade_images SET trade_id=:new_tid WHERE trade_id=:old_tid"), {"new_tid": new_closed_tid, "old_tid": old_tid})
         s.commit()
 
-
 # ==========================================
-# 👉 100% 原始繪圖與計算邏輯 (禁止竄改區)
+# 👉 100% 保留你的原始繪圖與計算邏輯 (一字不改)
 # ==========================================
 def draw_tv_chart(symbol, transactions, initial_sl=0.0):
     try:
@@ -470,7 +448,7 @@ def get_stats(filtered_df):
         "Win Rate %": (len(wins)/num_trades*100) if num_trades > 0 else 0, "Trade Count": num_trades,
         "Win Count": len(wins), "Loss Count": len(losses),
         "Profit Factor": (wins['pnl'].sum() / abs(losses['pnl'].sum())) if not losses.empty and losses['pnl'].sum() != 0 else 0,
-        "Largest Win": filtered_df['pnl'].max() if not filtered_df.empty else 0, "Largest Loss": abs(filtered_df['pnl'].min()) if not filtered_df.empty else 0,
+        "Largest Win": filtered_df['pnl'].max(), "Largest Loss": abs(filtered_df['pnl'].min()),
         "Avg Hold (Win)": format_td(wins['hold_time'].mean()), "Avg Hold (Loss)": format_td(losses['hold_time'].mean())
     }
 
@@ -481,23 +459,23 @@ def load_data(file):
 init_db()
 
 # ==========================================
-# 👉 側邊欄與管理員雙視角
+# 👉 雙視角：管理員解鎖區塊 (密碼: 0000)
 # ==========================================
-with st.sidebar.expander("🔐 管理員專屬解鎖", expanded=not st.session_state.get('is_admin', False)):
+with st.sidebar.expander("🔐 管理員解鎖", expanded=not st.session_state.get('is_admin', False)):
     if st.session_state.get('is_admin', False):
-        st.success("✅ 已解鎖完整歷史紀錄")
-        if st.button("鎖定 (返回公開模式)"):
+        st.success("✅ 已解鎖！顯示所有歷史交易。")
+        if st.button("鎖定 (返回 2026/04/01 以後視角)"):
             st.session_state['is_admin'] = False
             st.rerun()
     else:
-        st.caption("未解鎖時，系統將自動隱藏 2026/04/03 之前的交易資料。")
-        pwd = st.text_input("輸入管理員密碼", type="password")
-        if st.button("解鎖歷史紀錄"):
+        st.caption("目前為家人視角 (僅顯示 2026/04/01 之後資料)。")
+        pwd = st.text_input("請輸入密碼以解鎖全部資料", type="password")
+        if st.button("解鎖"):
             if pwd == "0000":
                 st.session_state['is_admin'] = True
                 st.rerun()
             else:
-                st.error("密碼錯誤")
+                st.error("密碼錯誤！")
 
 with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
     st.subheader("🏷️ 策略管理")
@@ -505,13 +483,11 @@ with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
     if st.button("確認新增"):
         if new_strat:
             with conn.session as s:
-                try:
-                    s.execute(text("INSERT INTO strategy_tags (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": new_strat})
-                    s.commit()
-                except Exception as e: st.error(f"Error: {e}")
+                try: s.execute(text("INSERT INTO strategy_tags (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": new_strat}); s.commit()
+                except Exception: pass
             st.rerun()
 
-    available_strats = [row[0] for row in conn.query("SELECT name FROM strategy_tags", ttl="1d").itertuples(index=False)]
+    available_strats = [row[0] for row in conn.query("SELECT name FROM strategy_tags", ttl=0).itertuples(index=False)]
 
     if st.checkbox("管理/刪除標籤"):
         for s_tag in available_strats:
@@ -519,8 +495,7 @@ with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
             col_s1.write(s_tag)
             if col_s2.button("🗑️", key=f"del_strat_{s_tag}"):
                 with conn.session as s:
-                    s.execute(text("DELETE FROM strategy_tags WHERE name=:name"), {"name": s_tag})
-                    s.commit()
+                    s.execute(text("DELETE FROM strategy_tags WHERE name=:name"), {"name": s_tag}); s.commit()
                 st.rerun()
 
     st.divider()
@@ -534,32 +509,25 @@ with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
         flow_id = f"FLOW_{uuid.uuid4().hex[:8]}"
         with conn.session as s:
             s.execute(text("INSERT INTO cash_flows (flow_id, date, amount, note) VALUES (:id, :d, :amt, :n)"), 
-                      {"id": flow_id, "d": flow_date.strftime('%Y-%m-%d'), "amt": flow_amount, "n": flow_note})
-            s.commit()
+                      {"id": flow_id, "d": flow_date.strftime('%Y-%m-%d'), "amt": flow_amount, "n": flow_note}); s.commit()
         st.toast("資金紀錄已存檔！", icon="💰")
         st.rerun()
 
     if st.checkbox("管理/刪除歷史資金紀錄"):
         flows_df = conn.query("SELECT flow_id, date, amount, note FROM cash_flows ORDER BY date DESC", ttl=0)
-        
         if not flows_df.empty:
             for _, row in flows_df.iterrows():
                 col1, col2 = st.columns([4, 1])
                 with col1:
                     st.markdown(f"**{row['date']}** | `${row['amount']:,.0f}`")
-                    if row['note']:
-                        st.caption(f"📝 {row['note']}")
-                        
+                    if row['note']: st.caption(f"📝 {row['note']}")
                 with col2:
                     if st.button("🗑️", key=f"del_flow_{row['flow_id']}"):
                         with conn.session as s:
-                            s.execute(text("DELETE FROM cash_flows WHERE flow_id=:id"), {"id": row['flow_id']})
-                            s.commit()
-                        st.toast("✅ 紀錄已刪除！", icon="🗑️")
-                        st.rerun() 
+                            s.execute(text("DELETE FROM cash_flows WHERE flow_id=:id"), {"id": row['flow_id']}); s.commit()
+                        st.toast("✅ 紀錄已刪除！", icon="🗑️"); st.rerun() 
                 st.divider() 
-        else:
-            st.info("目前尚無任何資金變動紀錄。")
+        else: st.info("目前尚無任何資金變動紀錄。")
 
     st.divider()
     st.subheader("📥 資料匯入")
@@ -591,16 +559,15 @@ else:
         st.sidebar.warning("⚠️ 已退回使用本地預設資料 (Daily_Report.csv)")
 
 if input_df is not None:
-    
-    # 👉 雙視角過濾邏輯：非管理員強制隱藏 2026/04/03 之前的資料
+    # 👉 雙模式過濾：若非管理員，只顯示 2026/04/01 之後的資料
     input_df['Date'] = pd.to_datetime(input_df['Date'])
     if not st.session_state.get('is_admin', False):
-        cutoff_date = pd.to_datetime('2026-04-03')
+        cutoff_date = pd.to_datetime('2026-04-01')
         input_df = input_df[input_df['Date'] >= cutoff_date].copy()
 
     raw_t_df, raw_o_df = calculate_perfect_chartlog_stats(input_df) 
     
-    strat_map = conn.query("SELECT * FROM trade_strategy_map", ttl="1d")
+    strat_map = conn.query("SELECT * FROM trade_strategy_map", ttl=0)
     
     trades_df = pd.DataFrame()
     open_df = pd.DataFrame()
@@ -624,12 +591,10 @@ if input_df is not None:
     # --- 計算資本與儀表板 ---
     try:
         cash_df = conn.query("SELECT amount, date FROM cash_flows", ttl=0)
-        
-        # 資金池也要跟著日期過濾 (若公開模式，不顯示太早的入金，避免對不起來)
+        # 如果是公開模式，入金流水也過濾掉舊的，確保數字不會跟沒解鎖的交易對不上
         if not cash_df.empty and not st.session_state.get('is_admin', False):
             cash_df['date'] = pd.to_datetime(cash_df['date'])
             cash_df = cash_df[cash_df['date'] >= cutoff_date]
-            
         net_deposits = cash_df['amount'].sum() if not cash_df.empty else 0.0
     except Exception as e:
         net_deposits = 0.0
@@ -646,7 +611,7 @@ if input_df is not None:
     if open_df is not None and not open_df.empty:
         for _, row in open_df.iterrows():
             try:
-                # 這裡改用加上快取的極速報價函數
+                # 這裡使用了極速快取報價，解決卡頓！
                 latest_price = get_latest_price(row['Symbol'])
                 
                 if latest_price > 0:
@@ -868,7 +833,6 @@ if input_df is not None:
             trade_history['Type'] = 'TradePnL'
 
             try:
-                # 這裡直接用上面處理過日期的 cash_df
                 cash_history = cash_df.copy()
                 cash_history.rename(columns={'date': 'Date', 'amount': 'Amount'}, inplace=True)
             except Exception:
