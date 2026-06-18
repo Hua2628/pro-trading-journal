@@ -320,6 +320,7 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
 @st.cache_data
 def calculate_perfect_chartlog_stats(df):
     df.columns = df.columns.str.strip()
+    
     try:
         type_col = next(col for col in df.columns if df[col].astype(str).str.contains('Buy|Sell', case=False, na=False).any())
     except StopIteration: 
@@ -345,70 +346,51 @@ def calculate_perfect_chartlog_stats(df):
     
     for _, row in df.iterrows():
         symbol = str(row['Symbol']).strip()
-        if symbol.lower() == 'nan' or symbol == '' or symbol == '-': continue
+        if symbol.lower() == 'nan' or symbol == '' or symbol == '-':
+            continue
             
         t_type = str(row[type_col]).strip().capitalize()
         qty = row['Quantity']
         amt = row['Net Cash']
         date = row['Date']
 
-        is_buy = 'Buy' in t_type
-        is_sell = 'Sell' in t_type
-        if not is_buy and not is_sell: continue
-        if qty == 0: continue
-
-        cost_per_share = abs(amt) / qty if qty > 0 else 0
-        trade_price = float(str(row[price_col]).replace(',', '').strip()) if price_col and pd.notnull(row[price_col]) else cost_per_share
+        trade_price = 0
+        if price_col and pd.notnull(row[price_col]):
+            try:
+                trade_price = float(str(row[price_col]).replace(',', '').strip())
+            except ValueError:
+                trade_price = 0
         
-        if symbol not in tracker: 
-            tracker[symbol] = {'qty': 0, 'cost_basis': 0, 'start_date': date, 'transactions': []}
+        if qty == 0: 
+            continue
+            
+        if symbol not in tracker: tracker[symbol] = {'qty': 0, 'cash_flow': 0, 'start_date': date, 'transactions': []}
         t = tracker[symbol]
-
-        t['transactions'].append({'date': date, 'type': t_type, 'qty': qty, 'price': trade_price})
-
-        if t['qty'] == 0:
-            t['qty'] = qty if is_buy else -qty
-            t['cost_basis'] = abs(amt)
-            t['start_date'] = date
-        elif (t['qty'] > 0 and is_buy) or (t['qty'] < 0 and is_sell):
-            t['qty'] += qty if is_buy else -qty
-            t['cost_basis'] += abs(amt)
+        
+        if 'Buy' in t_type: 
+            t['qty'] += qty
+            t['cash_flow'] -= amt 
+            t['transactions'].append({'date': date, 'type': 'Buy', 'qty': qty, 'price': trade_price})
+        elif 'Sell' in t_type: 
+            t['qty'] -= qty
+            t['cash_flow'] += amt
+            t['transactions'].append({'date': date, 'type': 'Sell', 'qty': qty, 'price': trade_price})
         else:
-            # 進行減倉操作，立即釋放該部分的已實現損益
-            close_qty = min(qty, abs(t['qty']))
-            avg_cost_per_share = t['cost_basis'] / abs(t['qty'])
-            cost_of_closed = avg_cost_per_share * close_qty
+            continue
             
-            if t['qty'] > 0: # 多單平倉
-                realized = abs(amt) * (close_qty / qty) - cost_of_closed
-            else: # 空單回補
-                realized = cost_of_closed - abs(amt) * (close_qty / qty)
-            
-            t['qty'] -= close_qty if t['qty'] > 0 else -close_qty
-            t['cost_basis'] -= cost_of_closed
-
-            tid = f"{date.strftime('%Y%m%d')}_{symbol}_{round(realized, 2)}"
+        # 💡 原版精髓：庫存歸零時，才將累積的現金流轉為最終損益
+        if abs(t['qty']) < 1e-5:
+            tid = f"{date.strftime('%Y%m%d')}_{symbol}_{round(t['cash_flow'], 2)}"
             closed_trades.append({
-                'trade_id': tid, 
-                'Exit_Date': date.strftime('%Y-%m-%d'), 
-                'Symbol': symbol, 
-                'pnl': realized, 
-                'hold_time': date - t['start_date'], 
-                'raw_date': date,
+                'trade_id': tid, 'Exit_Date': date.strftime('%Y-%m-%d'), 
+                'Symbol': symbol, 'pnl': t['cash_flow'], 
+                'hold_time': date - t['start_date'], 'raw_date': date,
                 'entry_date': t['start_date'],
-                'transactions': t['transactions'].copy()
+                'transactions': t['transactions'].copy() 
             })
             migrate_open_trade_data(symbol, tid)
-
-            remain_qty = qty - close_qty
-            if remain_qty > 1e-5:
-                t['qty'] = remain_qty if is_buy else -remain_qty
-                t['cost_basis'] = abs(amt) * (remain_qty / qty)
-                t['start_date'] = date
-                
-            if abs(t['qty']) < 1e-5:
-                del tracker[symbol]
-                
+            del tracker[symbol]
+            
     open_trades = []
     for symbol, t in tracker.items():
         if abs(t['qty']) >= 1e-5:
