@@ -45,6 +45,7 @@ key_supa: str = os.environ.get("SUPABASE_KEY") or st.secrets.get("SUPABASE_KEY",
 supabase: Client = create_client(url_supa, key_supa)
 STORAGE_BUCKET = "trade_images"
 
+@st.cache_resource
 def init_db():
     with conn.session as s:
         s.execute(text("""
@@ -87,6 +88,13 @@ def fetch_github_csv(pat, fetch_url):
         if res.status_code == 200: return res.text
         return None
     except: return None
+@st.cache_data(ttl="5m")
+def get_latest_price(symbol):
+    try:
+        hist = yf.Ticker(symbol).history(period="1d")
+        return hist['Close'].iloc[-1] if not hist.empty else 0
+    except Exception:
+        return 0
 
 # --- 雲端自動存檔轉換邏輯 ---
 def auto_save_risk_params():
@@ -590,9 +598,8 @@ if input_df is not None:
     if open_df is not None and not open_df.empty:
         for _, row in open_df.iterrows():
             try:
-                ticker = yf.Ticker(row['Symbol'])
-                hist = ticker.history(period="1d")
-                latest_price = hist['Close'].iloc[-1] if not hist.empty else 0
+                # ✅ 替換成這行 (0 延遲讀取快取)
+                latest_price = get_latest_price(row['Symbol'])
                 
                 if latest_price > 0:
                     txs = row['transactions']
