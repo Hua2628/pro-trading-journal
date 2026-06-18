@@ -816,8 +816,8 @@ if input_df is not None:
 
                 if 'portfolio_df' in locals() and not portfolio_df.empty:
                     st.subheader("🔥 投資組合 (未平倉)")
-                    curr_cap = st.session_state.get('current_capital', 0)
-                    proj_cap = st.session_state.get('projected_capital', 0)
+                    curr_cap = current_capital
+                    proj_cap = projected_capital
                     import plotly.graph_objects as go
                     
                     proj_color = '#089981' if proj_cap >= curr_cap else '#f23645'
