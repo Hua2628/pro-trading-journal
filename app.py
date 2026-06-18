@@ -729,12 +729,18 @@ if input_df is not None:
             else: st.info("目前尚無已平倉的交易可供統計。")
 
 # 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
+# 📈 繪製資金曲線 (Equity Curve - 時間加權報酬率 TWR)
         with tab_equity:
             trade_history = display_df.groupby('Exit_Date')['pnl'].sum().reset_index() if not display_df.empty else pd.DataFrame(columns=['Exit_Date', 'pnl'])
             trade_history.rename(columns={'Exit_Date': 'Date', 'pnl': 'Amount'}, inplace=True)
             trade_history['Type'] = 'TradePnL'
 
-            conn = sqlite3.connect(DB_NAME)
+            # ✅ 直接使用雲端連線讀取，乾淨俐落！
+            try:
+                cash_history = conn.query("SELECT date as Date, amount as Amount FROM cash_flows", ttl=0)
+            except Exception:
+                cash_history = pd.DataFrame(columns=['Date', 'Amount'])
+            cash_history['Type'] = 'CashFlow'
 # ✅ 修正為專屬雲端 PostgreSQL 的讀取方式
             try:
                 cash_history = conn.query("SELECT date as Date, amount as Amount FROM cash_flows", ttl=0)
