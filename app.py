@@ -16,39 +16,10 @@ from sqlalchemy import text
 from supabase import create_client, Client
 
 # ==========================================
-# 👉 [安全性防護] 1. 密碼登入閘門
+# 👉 全域環境設定
 # ==========================================
 st.set_page_config(page_title="Pro Trading Journal", layout="wide", page_icon="📈")
 
-def check_password():
-    """回傳 True 如果密碼正確"""
-    def password_entered():
-        if st.session_state["password"] == st.secrets["app_password"]:
-            st.session_state["password_correct"] = True
-            del st.session_state["password"]  # 安全起見，核對後刪除密碼暫存
-        else:
-            st.session_state["password_correct"] = False
-
-    if st.session_state.get("password_correct", False):
-        return True
-
-    st.markdown("<h2 style='text-align: center; margin-top: 50px;'>🔒 Pro Trading Journal 專屬登入</h2>", unsafe_allow_html=True)
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
-        st.info("請輸入通關密碼以檢視交易紀錄。")
-        st.text_input("密碼", type="password", on_change=password_entered, key="password")
-        if "password_correct" in st.session_state and not st.session_state["password_correct"]:
-            st.error("密碼錯誤，請重新輸入。")
-    return False
-
-# 🛑 核心防護：必須通過驗證才會執行後續的 UI 與資料庫讀取
-if not check_password():
-    st.stop()
-
-
-# ==========================================
-# 👉 [UI優化] 1. 全域環境設定與自訂 CSS 注入
-# ==========================================
 st.markdown("""
 <style>
     .block-container {
@@ -87,10 +58,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- 環境設定與 Supabase 初始化 ---
-# 初始化資料庫連線 (PostgreSQL)
 conn = st.connection("postgresql", type="sql", ttl=0)
 
-# 初始化 Supabase Storage 用戶端
 url: str = st.secrets["SUPABASE_URL"]
 key: str = st.secrets["SUPABASE_KEY"]
 supabase: Client = create_client(url, key)
@@ -116,29 +85,24 @@ def init_db():
             flow_id TEXT PRIMARY KEY,
             date TEXT,
             amount REAL,
-            note TEXT,
-            account TEXT DEFAULT '總和資金池'
+            note TEXT
         )
         """))
-        
-        # 確保 trade_images 存在
         s.execute(text("CREATE TABLE IF NOT EXISTS trade_images (trade_id TEXT, image_path TEXT, category TEXT DEFAULT 'general')"))
-        
         s.execute(text("CREATE TABLE IF NOT EXISTS monthly_reviews (month_id TEXT PRIMARY KEY, note TEXT)"))
         s.execute(text("CREATE TABLE IF NOT EXISTS strategy_tags (name TEXT PRIMARY KEY)"))
         s.execute(text("CREATE TABLE IF NOT EXISTS trade_strategy_map (trade_id TEXT PRIMARY KEY, strategy_name TEXT)"))
         s.execute(text("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)"))
         
-        # 檢查並插入預設策略標籤
         cursor = s.execute(text("SELECT COUNT(*) FROM strategy_tags"))
         if cursor.fetchone()[0] == 0:
             for strat in ["EP", "突破", "M.E.T.A", "情緒性交易"]:
                 s.execute(text("INSERT INTO strategy_tags (name) VALUES (:name) ON CONFLICT DO NOTHING"), {"name": strat})
         else:
              s.execute(text("INSERT INTO strategy_tags (name) VALUES ('情緒性交易') ON CONFLICT DO NOTHING"))
-        
         s.commit()
 
+# --- 極速快取設計：大幅降低重複讀取時間 ---
 @st.cache_data(ttl="1d") 
 def get_stock_data(symbol):
     return yf.download(symbol, period="5y", interval='1d', progress=False)
@@ -147,13 +111,32 @@ def get_stock_data(symbol):
 def get_spx_data():
     return yf.download('^GSPC', period="5y", interval='1d', progress=False)
 
+@st.cache_data(ttl="5m")
+def get_latest_price(symbol):
+    try:
+        hist = yf.Ticker(symbol).history(period="1d")
+        return hist['Close'].iloc[-1] if not hist.empty else 0
+    except:
+        return 0
+
+@st.cache_data(ttl="1h")
+def fetch_github_csv(pat, fetch_url):
+    headers = {"Authorization": f"token {pat}", "Accept": "application/vnd.github.v3.raw"}
+    try:
+        res = requests.get(fetch_url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            return res.text
+        return None
+    except:
+        return None
+
+# --- 資料庫存檔邏輯 ---
 def auto_save_risk_params():
     if 'current_trade' in st.session_state:
         tid = st.session_state.current_trade['trade_id']
         sl_val = st.session_state.get(f"sl_{tid}", 0.0)
         trail_val = st.session_state.get(f"trail_{tid}", 0.0)
         risk_val = st.session_state.get(f"risk_{tid}", 1.0)
-        
         with conn.session as s:
             result = s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone()
             if result:
@@ -227,21 +210,24 @@ def migrate_open_trade_data(symbol, new_closed_tid):
     with conn.session as s:
         if not s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": new_closed_tid}).fetchone():
             s.execute(text("UPDATE notes SET trade_id=:new_tid WHERE trade_id=:old_tid"), {"new_tid": new_closed_tid, "old_tid": old_tid})
-            
         if not s.execute(text("SELECT 1 FROM trade_strategy_map WHERE trade_id=:tid"), {"tid": new_closed_tid}).fetchone():
             s.execute(text("UPDATE trade_strategy_map SET trade_id=:new_tid WHERE trade_id=:old_tid"), {"new_tid": new_closed_tid, "old_tid": old_tid})
-            
         if not s.execute(text("SELECT 1 FROM trade_images WHERE trade_id=:tid"), {"tid": new_closed_tid}).fetchone():
             s.execute(text("UPDATE trade_images SET trade_id=:new_tid WHERE trade_id=:old_tid"), {"new_tid": new_closed_tid, "old_tid": old_tid})
         s.commit()
 
-# --- TV Chart 繪製邏輯 ---
+
+# ==========================================
+# 👉 100% 原始繪圖與計算邏輯 (禁止竄改區)
+# ==========================================
 def draw_tv_chart(symbol, transactions, initial_sl=0.0):
     try:
+        # 1. 抓取資料
         df = get_stock_data(symbol).copy()
         spx_df = get_spx_data().copy()
         if df.empty: return None
 
+        # 資料清洗與欄位重命名
         for d in [df, spx_df]:
             if isinstance(d.columns, pd.MultiIndex): 
                 d.columns = d.columns.get_level_values(0)
@@ -279,7 +265,7 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
         df['borderColor'] = border_colors
         df['wickColor'] = wick_colors
 
-        chart = StreamlitChart(height=600)
+        chart = StreamlitChart(height=1200)
         chart.layout(background_color='#FFFFFF', text_color='#333333')
         chart.grid(color='#e0e3eb')
 
@@ -374,9 +360,9 @@ def draw_tv_chart(symbol, transactions, initial_sl=0.0):
 
         return chart
     except Exception as e:
+        import traceback
         return f"圖表發生錯誤: {str(e)}"
 
-# --- 績效計算邏輯 ---
 @st.cache_data
 def calculate_perfect_chartlog_stats(df):
     df.columns = df.columns.str.strip()
@@ -393,12 +379,7 @@ def calculate_perfect_chartlog_stats(df):
             break
     
     df['Date'] = pd.to_datetime(df['Date'])
-    # 處理可能的欄位遺漏
-    if 'Net Cash' in df.columns:
-         df['Net Cash'] = pd.to_numeric(df['Net Cash'].astype(str).str.replace(',', ''), errors='coerce').abs().fillna(0)
-    else:
-         df['Net Cash'] = 0
-         
+    df['Net Cash'] = pd.to_numeric(df['Net Cash'].astype(str).str.replace(',', ''), errors='coerce').abs().fillna(0)
     df['Quantity'] = pd.to_numeric(df['Quantity'].astype(str).str.replace(',', ''), errors='coerce').abs().fillna(0)
     
     if len(df) > 1 and df['Date'].iloc[0] > df['Date'].iloc[-1]:
@@ -425,10 +406,6 @@ def calculate_perfect_chartlog_stats(df):
                 trade_price = float(str(row[price_col]).replace(',', '').strip())
             except ValueError:
                 trade_price = 0
-        
-        # 動態補足金額 (如果 CSV 沒有 Net Cash 且我們有價量)
-        if amt == 0 and trade_price > 0 and qty > 0:
-             amt = trade_price * qty
         
         if qty == 0: 
             continue
@@ -501,13 +478,27 @@ def get_stats(filtered_df):
 def load_data(file):
     return pd.read_csv(file)
 
-
 init_db()
 
+# ==========================================
+# 👉 側邊欄與管理員雙視角
+# ==========================================
+with st.sidebar.expander("🔐 管理員專屬解鎖", expanded=not st.session_state.get('is_admin', False)):
+    if st.session_state.get('is_admin', False):
+        st.success("✅ 已解鎖完整歷史紀錄")
+        if st.button("鎖定 (返回公開模式)"):
+            st.session_state['is_admin'] = False
+            st.rerun()
+    else:
+        st.caption("未解鎖時，系統將自動隱藏 2026/04/03 之前的交易資料。")
+        pwd = st.text_input("輸入管理員密碼", type="password")
+        if st.button("解鎖歷史紀錄"):
+            if pwd == "0000":
+                st.session_state['is_admin'] = True
+                st.rerun()
+            else:
+                st.error("密碼錯誤")
 
-# ==========================================
-# 👉 [UI優化] 3. 優化側邊欄 (Sidebar) 的收納
-# ==========================================
 with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
     st.subheader("🏷️ 策略管理")
     new_strat = st.text_input("新增策略標籤")
@@ -520,7 +511,7 @@ with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
                 except Exception as e: st.error(f"Error: {e}")
             st.rerun()
 
-    available_strats = [row[0] for row in conn.query("SELECT name FROM strategy_tags", ttl=0).itertuples(index=False)]
+    available_strats = [row[0] for row in conn.query("SELECT name FROM strategy_tags", ttl="1d").itertuples(index=False)]
 
     if st.checkbox("管理/刪除標籤"):
         for s_tag in available_strats:
@@ -539,27 +530,23 @@ with st.sidebar.expander("⚙️ 系統設定與匯入", expanded=False):
     flow_amount = st.number_input("金額 (美金, 出金請輸入負數)", step=1000.0)
     flow_note = st.text_input("備註說明", placeholder="例如：初始本金")
     
-    # 👉 [帳戶視角] 1. 新增入金歸屬帳戶選項
-    account_options = ["總和資金池", "媽媽的帳戶", "哥哥的帳戶"]
-    flow_account = st.selectbox("歸屬帳戶", options=account_options)
-    
     if st.button("確認提交資金紀錄"):
         flow_id = f"FLOW_{uuid.uuid4().hex[:8]}"
         with conn.session as s:
-            s.execute(text("INSERT INTO cash_flows (flow_id, date, amount, note, account) VALUES (:id, :d, :amt, :n, :acc)"), 
-                      {"id": flow_id, "d": flow_date.strftime('%Y-%m-%d'), "amt": flow_amount, "n": flow_note, "acc": flow_account})
+            s.execute(text("INSERT INTO cash_flows (flow_id, date, amount, note) VALUES (:id, :d, :amt, :n)"), 
+                      {"id": flow_id, "d": flow_date.strftime('%Y-%m-%d'), "amt": flow_amount, "n": flow_note})
             s.commit()
         st.toast("資金紀錄已存檔！", icon="💰")
         st.rerun()
 
     if st.checkbox("管理/刪除歷史資金紀錄"):
-        flows_df = conn.query("SELECT flow_id, date, amount, note, account FROM cash_flows ORDER BY date DESC", ttl=0)
+        flows_df = conn.query("SELECT flow_id, date, amount, note FROM cash_flows ORDER BY date DESC", ttl=0)
         
         if not flows_df.empty:
             for _, row in flows_df.iterrows():
                 col1, col2 = st.columns([4, 1])
                 with col1:
-                    st.markdown(f"**{row['date']}** | `${row['amount']:,.0f}` | 🏷️ {row['account']}")
+                    st.markdown(f"**{row['date']}** | `${row['amount']:,.0f}`")
                     if row['note']:
                         st.caption(f"📝 {row['note']}")
                         
@@ -590,40 +577,30 @@ else:
     GITHUB_PAT = st.secrets.get("GITHUB_PAT", "") 
 
     if GITHUB_PAT:
-        url = f"https://raw.githubusercontent.com/{GITHUB_USERNAME}/{REPO_NAME}/main/{FILE_PATH}"
-        headers = {
-            "Authorization": f"token {GITHUB_PAT}",
-            "Accept": "application/vnd.github.v3.raw"
-        }
-
+        url_csv = f"https://raw.githubusercontent.com/{GITHUB_USERNAME}/{REPO_NAME}/main/{FILE_PATH}"
         with st.sidebar.status("🔄 正在從 GitHub 取得最新紀錄...", expanded=True) as status:
-            try:
-                response = requests.get(url, headers=headers, timeout=10)
-                if response.status_code == 200:
-                    csv_data = io.StringIO(response.text)
-                    input_df = pd.read_csv(csv_data)
-                    status.update(label=f"✅ 成功讀取雲端資料！總筆數: {len(input_df)}", state="complete", expanded=False)
-                else:
-                    status.update(label=f"❌ 取資料失敗，狀態碼: {response.status_code}", state="error")
-            except Exception as e:
-                status.update(label=f"❌ 連線發生錯誤", state="error")
+            csv_text = fetch_github_csv(GITHUB_PAT, url_csv)
+            if csv_text:
+                input_df = pd.read_csv(io.StringIO(csv_text))
+                status.update(label=f"✅ 成功讀取雲端資料！總筆數: {len(input_df)}", state="complete", expanded=False)
+            else:
+                status.update(label=f"❌ 取資料失敗", state="error")
                 
     if input_df is None and os.path.exists("Daily_Report.csv"):
         input_df = load_data("Daily_Report.csv")
         st.sidebar.warning("⚠️ 已退回使用本地預設資料 (Daily_Report.csv)")
 
-# ==========================================
-# 👉 [帳戶視角] 2. 側邊欄帳戶過濾器
-# ==========================================
-st.sidebar.subheader("👤 選擇檢視帳戶")
-view_account = st.sidebar.selectbox("當前顯示", account_options)
-
 if input_df is not None:
-    # 根據帳戶標籤過濾輸入資料 (如果有 Account 欄位的話，目前假設 CSV 可能有或沒有)
-    # 如果 CSV 沒有分類，這裡就先呈現全部交易，但資金只算該帳戶的
+    
+    # 👉 雙視角過濾邏輯：非管理員強制隱藏 2026/04/03 之前的資料
+    input_df['Date'] = pd.to_datetime(input_df['Date'])
+    if not st.session_state.get('is_admin', False):
+        cutoff_date = pd.to_datetime('2026-04-03')
+        input_df = input_df[input_df['Date'] >= cutoff_date].copy()
+
     raw_t_df, raw_o_df = calculate_perfect_chartlog_stats(input_df) 
     
-    strat_map = conn.query("SELECT * FROM trade_strategy_map", ttl=0)
+    strat_map = conn.query("SELECT * FROM trade_strategy_map", ttl="1d")
     
     trades_df = pd.DataFrame()
     open_df = pd.DataFrame()
@@ -646,15 +623,15 @@ if input_df is not None:
         
     # --- 計算資本與儀表板 ---
     try:
-        # 只抓取選定帳戶的入金 (若選「總和資金池」則抓全部)
-        if view_account == "總和資金池":
-             cash_df = conn.query("SELECT amount FROM cash_flows", ttl=0)
-        else:
-             cash_df = conn.query(f"SELECT amount FROM cash_flows WHERE account = '{view_account}'", ttl=0)
-             
+        cash_df = conn.query("SELECT amount, date FROM cash_flows", ttl=0)
+        
+        # 資金池也要跟著日期過濾 (若公開模式，不顯示太早的入金，避免對不起來)
+        if not cash_df.empty and not st.session_state.get('is_admin', False):
+            cash_df['date'] = pd.to_datetime(cash_df['date'])
+            cash_df = cash_df[cash_df['date'] >= cutoff_date]
+            
         net_deposits = cash_df['amount'].sum() if not cash_df.empty else 0.0
     except Exception as e:
-        st.sidebar.error(str(e))
         net_deposits = 0.0
 
     realized_pnl = trades_df['pnl'].sum() if 'trades_df' in locals() and not trades_df.empty else 0.0
@@ -669,9 +646,8 @@ if input_df is not None:
     if open_df is not None and not open_df.empty:
         for _, row in open_df.iterrows():
             try:
-                ticker = yf.Ticker(row['Symbol'])
-                hist = ticker.history(period="1d")
-                latest_price = hist['Close'].iloc[-1] if not hist.empty else 0
+                # 這裡改用加上快取的極速報價函數
+                latest_price = get_latest_price(row['Symbol'])
                 
                 if latest_price > 0:
                     txs = row['transactions']
@@ -743,7 +719,7 @@ if input_df is not None:
     st.session_state['projected_capital'] = projected_capital
 
     if (not trades_df.empty) or (not open_df.empty):
-        st.title(f"📊 交易數據中心 - {view_account}")
+        st.title(f"📊 交易數據中心")
         
         display_df = pd.DataFrame()
         if trades_df is not None and not trades_df.empty:
@@ -892,10 +868,9 @@ if input_df is not None:
             trade_history['Type'] = 'TradePnL'
 
             try:
-                if view_account == "總和資金池":
-                     cash_history = conn.query("SELECT date as Date, amount as Amount FROM cash_flows", ttl=0)
-                else:
-                     cash_history = conn.query(f"SELECT date as Date, amount as Amount FROM cash_flows WHERE account = '{view_account}'", ttl=0)
+                # 這裡直接用上面處理過日期的 cash_df
+                cash_history = cash_df.copy()
+                cash_history.rename(columns={'date': 'Date', 'amount': 'Amount'}, inplace=True)
             except Exception:
                 cash_history = pd.DataFrame(columns=['Date', 'Amount'])
                 
@@ -1110,7 +1085,6 @@ if input_df is not None:
                     st.divider()
                     st.markdown("##### 📋 總經數據或市況截圖")
                     
-                    # 👉 Supabase 圖片渲染 (Market)
                     if not mkt_imgs.empty:
                         img_cols = st.columns(2)
                         for idx, g_row in mkt_imgs.iterrows():
@@ -1127,7 +1101,6 @@ if input_df is not None:
                                     with conn.session as s:
                                         s.execute(text("DELETE FROM trade_images WHERE image_path=:path"), {"path": g_url})
                                         s.commit()
-                                    # 理想情況下這裡也要呼叫 supabase 刪除 storage 的檔案
                                     file_name = g_url.split('/')[-1]
                                     supabase.storage.from_(STORAGE_BUCKET).remove([file_name])
                                     st.rerun()
@@ -1142,7 +1115,6 @@ if input_df is not None:
                                 file_name = f"{mkt_tid}_{up_img.name}"
                                 file_bytes = up_img.getvalue()
                                 
-                                # 上傳到 Supabase Storage
                                 try:
                                     supabase.storage.from_(STORAGE_BUCKET).upload(file=file_bytes, path=file_name, file_options={"content-type": "image/png"})
                                     public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(file_name)
@@ -1163,7 +1135,6 @@ if input_df is not None:
                             if st.session_state.get(f"last_hash_{mkt_tid}") != img_hash:
                                 file_name = f"{mkt_tid}_{uuid.uuid4().hex[:8]}.png"
                                 
-                                # 將 PIL Image 轉為 bytes
                                 img_byte_arr = io.BytesIO()
                                 pasted_img.image_data.save(img_byte_arr, format='PNG')
                                 file_bytes = img_byte_arr.getvalue()
@@ -1249,7 +1220,6 @@ if input_df is not None:
 
                         st.markdown("<hr style='margin: 10px 0;'>", unsafe_allow_html=True)
                         
-                        # 👉 Supabase 圖片渲染 (General)
                         if not general_imgs.empty:
                             img_cols = st.columns(2) 
                             for idx, g_row in general_imgs.iterrows():
@@ -1415,7 +1385,6 @@ if input_df is not None:
 
                     st.markdown("##### 📋 規劃圖附件")
                     
-                    # 👉 Supabase 圖片渲染 (Pre-plan)
                     if not pre_plan_imgs.empty:
                         for _, p_row in pre_plan_imgs.iterrows():
                             p_url = p_row['image_path']
@@ -1459,9 +1428,6 @@ if input_df is not None:
                             except Exception as e:
                                 st.error(f"貼上上傳失敗: {e}")
                 else: st.info("請點擊左側標的進行詳細檢討。")
-# ==========================================
-# 👉 [UI優化] 5. 加入空狀態 (Empty States) 引導設計
-# ==========================================
 else:
     st.title("📈 交易數據中心")
     st.info("請於左側上傳 CSV 檔案，或點擊側邊欄「系統設定與匯入」同步雲端資料。")
