@@ -513,7 +513,7 @@ else:
     GITHUB_USERNAME = "Hua2628" 
     REPO_NAME = "ib-daily-report"
     FILE_PATH = "Daily_Report.csv"
-    GITHUB_PAT = st.secrets.get("GITHUB_PAT", "") 
+    GITHUB_PAT = os.environ.get("GITHUB_PAT") or os.environ.get("github_pat", "")
 
     if GITHUB_PAT:
         url_csv = f"https://raw.githubusercontent.com/{GITHUB_USERNAME}/{REPO_NAME}/main/{FILE_PATH}"
