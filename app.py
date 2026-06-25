@@ -129,8 +129,7 @@ def auto_save_note():
         new_note = st.session_state[f"note_{tid}"]
         with conn.session as s:
             if s.execute(text("SELECT 1 FROM notes WHERE trade_id=:tid"), {"tid": tid}).fetchone(): 
-                s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": n_note, "tid": tid}) # 注意原本程式碼此處變數為 new_note
-                # 為了保險，修正為正確的變數名稱：
+                # 直接使用正確的變數 new_note 進行 UPDATE
                 s.execute(text("UPDATE notes SET note=:n WHERE trade_id=:tid"), {"n": new_note, "tid": tid})
             else: 
                 s.execute(text("INSERT INTO notes (trade_id, note) VALUES (:tid, :n)"), {"tid": tid, "n": new_note})
